@@ -890,9 +890,9 @@ Model Summary:
             
             # Prepare forecast data for writing
             if next_delivery_date is not None:
-                # Write headers with next delivery date column
-                headers = ['Forecast Date', 'Predicted Units', 'Generated On', 'Next Delivery Date']
-                worksheet.update('F1:I1', [headers])
+                # Write headers with strain column
+                headers = ['Forecast Date', 'Predicted Units', 'Strain', 'Generated On', 'Next Delivery Date']
+                worksheet.update('F1:J1', [headers])
                 
                 # Prepare forecast data
                 forecast_data = []
@@ -900,26 +900,27 @@ Model Summary:
                     forecast_data.append([
                         row['date'].strftime('%Y-%m-%d'),
                         f"{row['predicted_units']:.1f}",
+                        row.get('strain', 'Unknown'),
                         self.today.strftime('%Y-%m-%d'),
-                        display_next_delivery.strftime('%Y-%m-%d') if display_next_delivery else 'TBD'  # Add next delivery date to each row
+                        display_next_delivery.strftime('%Y-%m-%d') if display_next_delivery else 'TBD'
                     ])
                 
                 # Write forecast data
                 if forecast_data:
                     end_row = len(forecast_data) + 1
-                    range_name = f"F2:I{end_row}"
+                    range_name = f"F2:J{end_row}"
                     worksheet.update(range_name, forecast_data)
                 
                 # Write summary information
                 summary_headers = ['Next Delivery Date', 'Days Until Delivery']
-                worksheet.update('J1:K1', [summary_headers])
+                worksheet.update('K1:L1', [summary_headers])
                 
                 days_until = (next_delivery_date.date() - self.today).days
                 summary_data = [
                     next_delivery_date.strftime('%Y-%m-%d'),
                     str(days_until)
                 ]
-                worksheet.update('J2:K2', [summary_data])
+                worksheet.update('K2:L2', [summary_data])
                 
                 # Write delivery statistics if available
                 if delivery_stats:
@@ -984,25 +985,67 @@ Model Summary:
             # Preprocess data
             clean_data = self.preprocess_data(raw_data)
             
-            # Create time series
-            ts_data = self.create_time_series(clean_data)
+            # Get unique strains
+            unique_strains = clean_data['strain'].unique()
+            print(f"Found {len(unique_strains)} unique strains: {unique_strains}")
             
-            # Train intermittent forecaster
-            self.train_intermittent_forecaster(ts_data)
+            all_forecasts = []
+            all_next_delivery_dates = []
             
-            # Calculate delivery statistics
-            delivery_stats = self.calculate_delivery_statistics(ts_data)
+            # Create separate forecast for each strain
+            for strain in unique_strains:
+                print(f"\n=== Forecasting for strain: {strain} ===")
+                strain_data = clean_data[clean_data['strain'] == strain].copy()
+                
+                if len(strain_data) < 10:  # Skip strains with too little data
+                    print(f"Skipping {strain} - insufficient data ({len(strain_data)} records)")
+                    continue
+                
+                # Create time series for this strain
+                ts_data = self.create_time_series(strain_data)
+                
+                # Train intermittent forecaster for this strain
+                self.train_intermittent_forecaster(ts_data)
+                
+                # Calculate delivery statistics for this strain
+                delivery_stats = self.calculate_delivery_statistics(ts_data)
+                
+                # Make forecast for this strain
+                forecast_df, next_delivery_date, best_next_delivery_date = self.make_forecast(ts_data)
+                
+                # Add strain info to forecast
+                if len(forecast_df) > 0:
+                    forecast_df['strain'] = strain
+                    all_forecasts.append(forecast_df)
+                    
+                if next_delivery_date:
+                    all_next_delivery_dates.append({
+                        'strain': strain,
+                        'date': next_delivery_date,
+                        'best_date': best_next_delivery_date
+                    })
             
-            # Make forecast
-            forecast_df, next_delivery_date, best_next_delivery_date = self.make_forecast(ts_data)
-            
-            # Create visualization
-            plot_filename = self.create_forecast_visualization(ts_data, forecast_df, next_delivery_date)
-            
-            # Write results to Google Sheets
-            self.write_forecast_to_sheets(forecast_df, next_delivery_date, delivery_stats, best_next_delivery_date)
-            
-            print("Forecasting pipeline completed successfully!")
+            # Combine all strain forecasts
+            if all_forecasts:
+                combined_forecast = pd.concat(all_forecasts, ignore_index=True)
+                combined_forecast = combined_forecast.sort_values('date')
+                
+                # Find the earliest next delivery across all strains
+                if all_next_delivery_dates:
+                    earliest_delivery = min(all_next_delivery_dates, key=lambda x: x['date'])
+                    next_delivery_date = earliest_delivery['date']
+                    best_next_delivery_date = earliest_delivery['best_date']
+                    print(f"\nEarliest next delivery: {next_delivery_date} ({earliest_delivery['strain']})")
+                else:
+                    next_delivery_date = None
+                    best_next_delivery_date = None
+                
+                # Write combined results to Google Sheets
+                self.write_forecast_to_sheets(combined_forecast, next_delivery_date, None, best_next_delivery_date)
+                
+                print("Multi-strain forecasting pipeline completed successfully!")
+            else:
+                print("No forecasts generated - insufficient data for all strains")
             
         except Exception as e:
             print(f"Error in forecasting pipeline: {str(e)}")
