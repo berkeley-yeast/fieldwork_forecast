@@ -903,14 +903,23 @@ Model Summary:
                 worksheet.update('F1:J1', [headers])
                 
                 # Prepare forecast data
+                # Calculate the earliest delivery date for each group
+                group_earliest = {}
+                for group_name in forecast_df['group_name'].unique():
+                    group_data = forecast_df[forecast_df['group_name'] == group_name]
+                    group_earliest[group_name] = group_data['date'].min()
+                
                 forecast_data = []
                 for _, row in forecast_df.iterrows():
+                    group_name = row.get('group_name', 'Unknown')
+                    earliest_for_group = group_earliest.get(group_name, row['date'])
+                    
                     forecast_data.append([
                         row['date'].strftime('%Y-%m-%d'),
                         f"{row['predicted_units']:.1f}",
-                        row.get('group_name', 'Unknown'),
+                        group_name,
                         self.today.strftime('%Y-%m-%d'),
-                        row['date'].strftime('%Y-%m-%d')  # Next delivery matches the forecast date
+                        earliest_for_group.strftime('%Y-%m-%d')  # Show earliest delivery for this group
                     ])
                 
                 # Write forecast data
@@ -919,16 +928,41 @@ Model Summary:
                     range_name = f"F2:J{end_row}"
                     worksheet.update(range_name, forecast_data)
                 
-                # Write summary information
-                summary_headers = ['Next Delivery Date', 'Days Until Delivery']
-                worksheet.update('K1:L1', [summary_headers])
+                # Write summary information by group
+                # Collect next delivery dates by group from the combined forecast
+                group_summaries = {}
+                if len(forecast_df) > 0:
+                    # Group by group_name and get the earliest delivery for each
+                    for group_name in forecast_df['group_name'].unique():
+                        group_data = forecast_df[forecast_df['group_name'] == group_name]
+                        earliest_date = group_data['date'].min()
+                        days_until = (earliest_date.date() - self.today).days
+                        group_summaries[group_name] = {
+                            'date': earliest_date,
+                            'days_until': days_until
+                        }
                 
-                days_until = (next_delivery_date.date() - self.today).days
-                summary_data = [
-                    next_delivery_date.strftime('%Y-%m-%d'),
-                    str(days_until)
-                ]
-                worksheet.update('K2:L2', [summary_data])
+                # Write group-specific summaries
+                summary_headers = ['Group', 'Next Delivery', 'Days Until']
+                worksheet.update('K1:M1', [summary_headers])
+                
+                summary_data = []
+                for i, (group_name, info) in enumerate(group_summaries.items()):
+                    summary_data.append([
+                        group_name,
+                        info['date'].strftime('%Y-%m-%d'),
+                        str(info['days_until'])
+                    ])
+                
+                if summary_data:
+                    end_summary_row = len(summary_data) + 1
+                    worksheet.update(f'K2:M{end_summary_row}', summary_data)
+                    print(f"✅ Group summaries written to K2:M{end_summary_row}")
+                else:
+                    # Fallback: write overall next delivery if no group data
+                    days_until = (next_delivery_date.date() - self.today).days
+                    fallback_data = [['Overall', next_delivery_date.strftime('%Y-%m-%d'), str(days_until)]]
+                    worksheet.update('K2:M2', fallback_data)
                 
                 # Write delivery statistics if available
                 if delivery_stats:
