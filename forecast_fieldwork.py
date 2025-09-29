@@ -852,7 +852,7 @@ Model Summary:
             print(f"Error creating visualization: {str(e)}")
             return None
     
-    def write_forecast_to_sheets(self, forecast_df, next_delivery_date, delivery_stats=None, best_next_delivery_date=None):
+    def write_forecast_to_sheets(self, forecast_df, next_delivery_date, all_next_delivery_dates=None, best_next_delivery_date=None):
         """Write forecast results to Google Sheets starting at column F (index 6)"""
         print("Writing forecast to Google Sheets...")
         
@@ -903,23 +903,26 @@ Model Summary:
                 worksheet.update('F1:J1', [headers])
                 
                 # Prepare forecast data
-                # Calculate the earliest delivery date for each group
-                group_earliest = {}
+                # Calculate the most likely delivery date for each group
+                # Use the prediction with highest confidence (highest predicted units)
+                group_best = {}
                 for group_name in forecast_df['group_name'].unique():
                     group_data = forecast_df[forecast_df['group_name'] == group_name]
-                    group_earliest[group_name] = group_data['date'].min()
+                    # Get the date with the highest predicted units (most confident prediction)
+                    best_prediction = group_data.loc[group_data['predicted_units'].idxmax()]
+                    group_best[group_name] = best_prediction['date']
                 
                 forecast_data = []
                 for _, row in forecast_df.iterrows():
                     group_name = row.get('group_name', 'Unknown')
-                    earliest_for_group = group_earliest.get(group_name, row['date'])
+                    best_for_group = group_best.get(group_name, row['date'])
                     
                     forecast_data.append([
                         row['date'].strftime('%Y-%m-%d'),
                         f"{row['predicted_units']:.1f}",
                         group_name,
                         self.today.strftime('%Y-%m-%d'),
-                        earliest_for_group.strftime('%Y-%m-%d')  # Show earliest delivery for this group
+                        best_for_group.strftime('%Y-%m-%d')  # Show most confident delivery for this group
                     ])
                 
                 # Write forecast data
@@ -932,15 +935,30 @@ Model Summary:
                 # Collect next delivery dates by group from the combined forecast
                 group_summaries = {}
                 if len(forecast_df) > 0:
-                    # Group by group_name and get the earliest delivery for each
+                    # Group by group_name and get the most confident delivery for each
                     for group_name in forecast_df['group_name'].unique():
                         group_data = forecast_df[forecast_df['group_name'] == group_name]
-                        earliest_date = group_data['date'].min()
-                        days_until = (earliest_date.date() - self.today).days
+                        # Get the prediction with highest confidence (highest predicted units)
+                        best_prediction = group_data.loc[group_data['predicted_units'].idxmax()]
+                        best_date = best_prediction['date']
+                        days_until = (best_date.date() - self.today).days
                         group_summaries[group_name] = {
-                            'date': earliest_date,
+                            'date': best_date,
                             'days_until': days_until
                         }
+                
+                # Also include pattern-based predictions from all_next_delivery_dates
+                # that might not be in the main forecast
+                if all_next_delivery_dates:
+                    for delivery_info in all_next_delivery_dates:
+                        group_name = delivery_info['group_name']
+                        if group_name not in group_summaries:
+                            delivery_date = delivery_info['date']
+                            days_until = (delivery_date.date() - self.today).days
+                            group_summaries[group_name] = {
+                                'date': delivery_date,
+                                'days_until': days_until
+                            }
                 
                 # Write group-specific summaries
                 summary_headers = ['Group', 'Next Delivery', 'Days Until']
@@ -1104,7 +1122,7 @@ Model Summary:
                     best_next_delivery_date = None
                 
                 # Write combined results to Google Sheets
-                self.write_forecast_to_sheets(combined_forecast, next_delivery_date, None, best_next_delivery_date)
+                self.write_forecast_to_sheets(combined_forecast, next_delivery_date, all_next_delivery_dates, best_next_delivery_date)
                 
                 print("Multi-strain forecasting pipeline completed successfully!")
             else:
@@ -1119,7 +1137,7 @@ Model Summary:
                     # (avoid showing 0-unit "deliveries" in the spreadsheet)
                     empty_forecast = pd.DataFrame()
                     
-                    self.write_forecast_to_sheets(empty_forecast, next_delivery_date, None, best_next_delivery_date)
+                    self.write_forecast_to_sheets(empty_forecast, next_delivery_date, all_next_delivery_dates, best_next_delivery_date)
                     print("Pattern-based forecasting completed successfully!")
                 else:
                     print("No forecasts generated - insufficient data for all groups")
