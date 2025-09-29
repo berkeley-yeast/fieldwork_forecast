@@ -554,11 +554,9 @@ class FieldworkForecaster:
             best_next_delivery_date = pattern_based_next_delivery
             print(f"🎯 Next delivery (pattern-based): {best_next_delivery_date.date()}")
             
-            # Create a single row forecast for pattern-based prediction
-            top_forecasts = pd.DataFrame({
-                'date': [pattern_based_next_delivery],
-                'predicted_units': [0]  # Pattern-based, no specific amount
-            })
+            # Don't include pattern-based predictions in the main forecast
+            # (they'll be handled separately in the summary)
+            top_forecasts = pd.DataFrame()
         else:
             best_next_delivery_date = None
             top_forecasts = pd.DataFrame()
@@ -566,13 +564,17 @@ class FieldworkForecaster:
         
         forecast_df = top_forecasts
         
+        # Use the earliest forecast date as the next delivery date (should match the forecast)
         if len(forecast_df) > 0:
             next_delivery_date = forecast_df['date'].iloc[0]
-            print(f"Next predicted delivery date (>=50 BBL): {next_delivery_date.date()}")
+            print(f"Next predicted delivery date: {next_delivery_date.date()}")
             print(f"Predicted units: {forecast_df['predicted_units'].iloc[0]:.1f}")
+            
+            # Use the ML prediction as the best estimate (overriding pattern-based)
+            best_next_delivery_date = next_delivery_date
         else:
-            print("No significant deliveries (>=50 BBL) predicted in the next 4 weeks")
-            next_delivery_date = None
+            print("No deliveries predicted in the next 4 weeks")
+            next_delivery_date = best_next_delivery_date  # Use pattern-based if available
         
         # Return both the significant forecast and the best next delivery date estimate
         return forecast_df, next_delivery_date, best_next_delivery_date
@@ -908,7 +910,7 @@ Model Summary:
                         f"{row['predicted_units']:.1f}",
                         row.get('group_name', 'Unknown'),
                         self.today.strftime('%Y-%m-%d'),
-                        display_next_delivery.strftime('%Y-%m-%d') if display_next_delivery else 'TBD'
+                        row['date'].strftime('%Y-%m-%d')  # Next delivery matches the forecast date
                     ])
                 
                 # Write forecast data
@@ -1079,15 +1081,11 @@ Model Summary:
                     best_next_delivery_date = earliest_delivery['best_date']
                     print(f"\nPattern-based next delivery: {next_delivery_date} ({earliest_delivery['group_name']})")
                     
-                    # Create a dummy forecast dataframe for the pattern-based prediction
-                    pattern_forecast = pd.DataFrame({
-                        'date': [next_delivery_date],
-                        'predicted_units': [0],  # Pattern-based, no specific amount
-                        'group_type': [earliest_delivery['group_type']],
-                        'group_name': [earliest_delivery['group_name']]
-                    })
+                    # For pattern-based predictions, just write the summary without detailed forecast
+                    # (avoid showing 0-unit "deliveries" in the spreadsheet)
+                    empty_forecast = pd.DataFrame()
                     
-                    self.write_forecast_to_sheets(pattern_forecast, next_delivery_date, None, best_next_delivery_date)
+                    self.write_forecast_to_sheets(empty_forecast, next_delivery_date, None, best_next_delivery_date)
                     print("Pattern-based forecasting completed successfully!")
                 else:
                     print("No forecasts generated - insufficient data for all groups")
