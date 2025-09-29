@@ -229,12 +229,13 @@ class FieldworkForecaster:
         """Create time series with proper frequency and exogenous variables"""
         print("Creating time series...")
         
-        # Set date as index
+        # Set date as index, but first handle any duplicate dates
         df = df.set_index('date')
         
-        # Create daily time series (fill missing dates with 0)
-        date_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
-        ts = df.reindex(date_range, fill_value=0)
+        # Remove duplicate indices by keeping the first occurrence
+        if df.index.duplicated().any():
+            print(f"Found {df.index.duplicated().sum()} duplicate dates, keeping first occurrence")
+            df = df[~df.index.duplicated(keep='first')]
         
         # Aggregate by date (sum units, mode for strain and strain_type)
         daily_data = df.groupby(df.index.date).agg({
