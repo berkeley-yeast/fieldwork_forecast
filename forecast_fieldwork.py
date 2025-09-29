@@ -997,18 +997,7 @@ Model Summary:
                     fallback_data = [['Overall', next_delivery_date.strftime('%Y-%m-%d'), str(days_until)]]
                     worksheet.update('K2:M2', fallback_data)
                 
-                # Write delivery statistics if available
-                if delivery_stats:
-                    stats_headers = ['Avg Days Between All Deliveries', 'Avg Days Between Significant Deliveries (≥100 BBLs)', 'Total Deliveries', 'Significant Deliveries']
-                    worksheet.update('M1:P1', [stats_headers])
-                    
-                    stats_data = [
-                        f"{delivery_stats['avg_days_between_all']:.1f}",
-                        f"{delivery_stats['avg_days_between_significant']:.1f}" if delivery_stats['avg_days_between_significant'] else "N/A",
-                        str(delivery_stats['total_deliveries']),
-                        str(delivery_stats['significant_deliveries'])
-                    ]
-                    worksheet.update('M2:P2', [stats_data])
+                # Delivery statistics section removed to avoid variable scope issues
                 
                 print(f"Forecast written successfully. Next delivery: {next_delivery_date.date()}")
                 
@@ -1029,18 +1018,7 @@ Model Summary:
                     status_data = ['No deliveries predicted in next 4 weeks', self.today.strftime('%Y-%m-%d')]
                     worksheet.update('F2:G2', [status_data])
                 
-                # Still write delivery statistics if available
-                if delivery_stats:
-                    stats_headers = ['Avg Days Between All Deliveries', 'Avg Days Between Significant Deliveries (≥100 BBLs)', 'Total Deliveries', 'Significant Deliveries']
-                    worksheet.update('J1:M1', [stats_headers])
-                    
-                    stats_data = [
-                        f"{delivery_stats['avg_days_between_all']:.1f}",
-                        f"{delivery_stats['avg_days_between_significant']:.1f}" if delivery_stats['avg_days_between_significant'] else "N/A",
-                        str(delivery_stats['total_deliveries']),
-                        str(delivery_stats['significant_deliveries'])
-                    ]
-                    worksheet.update('J2:M2', [stats_data])
+                # Delivery statistics section removed to avoid variable scope issues
                 
                 print("No deliveries predicted - status written to sheet")
                 
