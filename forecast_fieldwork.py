@@ -890,8 +890,8 @@ Model Summary:
             
             # Prepare forecast data for writing
             if next_delivery_date is not None:
-                # Write headers with strain column
-                headers = ['Forecast Date', 'Predicted Units', 'Strain', 'Generated On', 'Next Delivery Date']
+                # Write headers with strain type column
+                headers = ['Forecast Date', 'Predicted Units', 'Strain Type', 'Generated On', 'Next Delivery Date']
                 worksheet.update('F1:J1', [headers])
                 
                 # Prepare forecast data
@@ -900,7 +900,7 @@ Model Summary:
                     forecast_data.append([
                         row['date'].strftime('%Y-%m-%d'),
                         f"{row['predicted_units']:.1f}",
-                        row.get('strain', 'Unknown'),
+                        row.get('strain_type', 'Unknown'),
                         self.today.strftime('%Y-%m-%d'),
                         display_next_delivery.strftime('%Y-%m-%d') if display_next_delivery else 'TBD'
                     ])
@@ -985,20 +985,20 @@ Model Summary:
             # Preprocess data
             clean_data = self.preprocess_data(raw_data)
             
-            # Get unique strains
-            unique_strains = clean_data['strain'].unique()
-            print(f"Found {len(unique_strains)} unique strains: {unique_strains}")
+            # Use strain_type instead of individual strains for better data grouping
+            unique_strain_types = clean_data['strain_type'].unique()
+            print(f"Found {len(unique_strain_types)} unique strain types: {unique_strain_types}")
             
             all_forecasts = []
             all_next_delivery_dates = []
             
-            # Create separate forecast for each strain
-            for strain in unique_strains:
-                print(f"\n=== Forecasting for strain: {strain} ===")
-                strain_data = clean_data[clean_data['strain'] == strain].copy()
+            # Create separate forecast for each strain type
+            for strain_type in unique_strain_types:
+                print(f"\n=== Forecasting for strain type: {strain_type} ===")
+                strain_data = clean_data[clean_data['strain_type'] == strain_type].copy()
                 
-                if len(strain_data) < 10:  # Skip strains with too little data
-                    print(f"Skipping {strain} - insufficient data ({len(strain_data)} records)")
+                if len(strain_data) < 5:  # Lower threshold for strain types
+                    print(f"Skipping {strain_type} - insufficient data ({len(strain_data)} records)")
                     continue
                 
                 # Create time series for this strain
@@ -1013,15 +1013,23 @@ Model Summary:
                 # Make forecast for this strain
                 forecast_df, next_delivery_date, best_next_delivery_date = self.make_forecast(ts_data)
                 
-                # Add strain info to forecast
+                # Add strain type info to forecast
                 if len(forecast_df) > 0:
-                    forecast_df['strain'] = strain
+                    forecast_df['strain_type'] = strain_type
                     all_forecasts.append(forecast_df)
                     
                 if next_delivery_date:
                     all_next_delivery_dates.append({
-                        'strain': strain,
+                        'strain_type': strain_type,
                         'date': next_delivery_date,
+                        'best_date': best_next_delivery_date
+                    })
+                
+                # Also add pattern-based predictions even if no ML predictions
+                if best_next_delivery_date and not next_delivery_date:
+                    all_next_delivery_dates.append({
+                        'strain_type': strain_type,
+                        'date': best_next_delivery_date,
                         'best_date': best_next_delivery_date
                     })
             
@@ -1030,12 +1038,12 @@ Model Summary:
                 combined_forecast = pd.concat(all_forecasts, ignore_index=True)
                 combined_forecast = combined_forecast.sort_values('date')
                 
-                # Find the earliest next delivery across all strains
+                # Find the earliest next delivery across all strain types
                 if all_next_delivery_dates:
                     earliest_delivery = min(all_next_delivery_dates, key=lambda x: x['date'])
                     next_delivery_date = earliest_delivery['date']
                     best_next_delivery_date = earliest_delivery['best_date']
-                    print(f"\nEarliest next delivery: {next_delivery_date} ({earliest_delivery['strain']})")
+                    print(f"\nEarliest next delivery: {next_delivery_date} ({earliest_delivery['strain_type']})")
                 else:
                     next_delivery_date = None
                     best_next_delivery_date = None
@@ -1045,7 +1053,24 @@ Model Summary:
                 
                 print("Multi-strain forecasting pipeline completed successfully!")
             else:
-                print("No forecasts generated - insufficient data for all strains")
+                # Even if no ML forecasts, write pattern-based predictions if available
+                if all_next_delivery_dates:
+                    earliest_delivery = min(all_next_delivery_dates, key=lambda x: x['date'])
+                    next_delivery_date = earliest_delivery['date']
+                    best_next_delivery_date = earliest_delivery['best_date']
+                    print(f"\nPattern-based next delivery: {next_delivery_date} ({earliest_delivery['strain_type']})")
+                    
+                    # Create a dummy forecast dataframe for the pattern-based prediction
+                    pattern_forecast = pd.DataFrame({
+                        'date': [next_delivery_date],
+                        'predicted_units': [0],  # Pattern-based, no specific amount
+                        'strain_type': [earliest_delivery['strain_type']]
+                    })
+                    
+                    self.write_forecast_to_sheets(pattern_forecast, next_delivery_date, None, best_next_delivery_date)
+                    print("Pattern-based forecasting completed successfully!")
+                else:
+                    print("No forecasts generated - insufficient data for all strain types")
             
         except Exception as e:
             print(f"Error in forecasting pipeline: {str(e)}")
