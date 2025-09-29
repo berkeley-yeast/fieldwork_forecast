@@ -371,8 +371,9 @@ class FieldworkForecaster:
         """Generate forecast for the next 4 weeks from today's date"""
         print(f"Generating {self.forecast_horizon}-day forecast from today ({self.today})...")
         
-        # Calculate forecast dates starting from today (not from last data date)
-        forecast_start = datetime.combine(self.today, datetime.min.time())
+        # Calculate forecast dates starting from tomorrow (not today)
+        tomorrow = self.today + timedelta(days=1)
+        forecast_start = datetime.combine(tomorrow, datetime.min.time())
         forecast_dates = pd.date_range(
             start=forecast_start,
             periods=self.forecast_horizon,
@@ -471,15 +472,14 @@ class FieldworkForecaster:
             delivery_sizes = np.full(len(forecast_dates), historical_avg)
         
         # Step 3: Combine probability and size to get expected delivery
-        # Only predict delivery if probability > threshold
-        probability_threshold = 0.3  # Adjust based on business needs
+        # Use a more conservative threshold for intermittent deliveries
+        probability_threshold = 0.1  # Lower threshold but still selective
         
         forecast_values = []
         for i, (prob, size) in enumerate(zip(delivery_probabilities, delivery_sizes)):
             if prob > probability_threshold:
-                # Scale the size by probability for expected value
-                expected_delivery = prob * size
-                forecast_values.append(expected_delivery)
+                # Use actual predicted size, not scaled by probability
+                forecast_values.append(size)
             else:
                 forecast_values.append(0)
         
@@ -539,13 +539,13 @@ class FieldworkForecaster:
         
         # Determine the best next delivery date estimate
         # Priority: 1) ML prediction >= 100 BBL, 2) Any ML prediction > 0, 3) Pattern-based prediction
-        significant_forecast = forecast_df[forecast_df['predicted_units'] >= 100.0]
-        print(f"Filtered forecast to {len(significant_forecast)} days with deliveries >= 100 BBLs in next 4 weeks")
+        significant_forecast = forecast_df[forecast_df['predicted_units'] >= 50.0]
+        print(f"Filtered forecast to {len(significant_forecast)} days with deliveries >= 50 BBLs in next 4 weeks")
         
         if len(significant_forecast) > 0:
             # Use the significant delivery prediction
             best_next_delivery_date = significant_forecast['date'].iloc[0]
-            print(f"🎯 Next delivery (>=100 BBL): {best_next_delivery_date.date()}")
+            print(f"🎯 Next delivery (>=50 BBL): {best_next_delivery_date.date()}")
         elif next_any_delivery_date is not None:
             # Use any delivery prediction
             best_next_delivery_date = next_any_delivery_date
@@ -562,10 +562,10 @@ class FieldworkForecaster:
         
         if len(forecast_df) > 0:
             next_delivery_date = forecast_df['date'].iloc[0]
-            print(f"Next predicted delivery date (>=100 BBL): {next_delivery_date.date()}")
+            print(f"Next predicted delivery date (>=50 BBL): {next_delivery_date.date()}")
             print(f"Predicted units: {forecast_df['predicted_units'].iloc[0]:.1f}")
         else:
-            print("No significant deliveries (>=100 BBL) predicted in the next 4 weeks")
+            print("No significant deliveries (>=50 BBL) predicted in the next 4 weeks")
             next_delivery_date = None
         
         # Return both the significant forecast and the best next delivery date estimate
