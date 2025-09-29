@@ -1125,6 +1125,38 @@ Model Summary:
             if all_forecasts:
                 combined_forecast = pd.concat(all_forecasts, ignore_index=True)
                 combined_forecast = combined_forecast.sort_values('date')
+            else:
+                combined_forecast = pd.DataFrame()
+            
+            # Add pattern-based predictions that don't have ML forecasts to the main table
+            for delivery_info in all_next_delivery_dates:
+                group_name = delivery_info['group_name']
+                # Check if this group already has ML predictions
+                if len(combined_forecast) == 0 or group_name not in combined_forecast['group_name'].values:
+                    # Use historical average for pattern-based predictions
+                    # Filter data for this specific group to get realistic units
+                    if delivery_info['group_type'] == 'strain_type':
+                        group_data = clean_data[clean_data['strain_type'] == group_name]
+                    else:
+                        group_data = clean_data[clean_data['strain'] == group_name]
+                    
+                    # Calculate average delivery size for this group
+                    avg_units = group_data[group_data['by_units'] > 0]['by_units'].mean()
+                    if pd.isna(avg_units):
+                        avg_units = 100.0  # Default fallback
+                    
+                    # Add pattern-based prediction to the main forecast
+                    pattern_row = pd.DataFrame({
+                        'date': [delivery_info['date']],
+                        'predicted_units': [avg_units],  # Use historical average
+                        'group_type': [delivery_info.get('group_type', 'pattern')],
+                        'group_name': [group_name]
+                    })
+                    combined_forecast = pd.concat([combined_forecast, pattern_row], ignore_index=True)
+            
+            # Sort the final combined forecast
+            if len(combined_forecast) > 0:
+                combined_forecast = combined_forecast.sort_values('date')
                 
                 # Find the earliest next delivery across all groups
                 if all_next_delivery_dates:
