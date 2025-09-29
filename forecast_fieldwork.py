@@ -537,9 +537,24 @@ class FieldworkForecaster:
                     forecast_df.loc[i, 'predicted_units'] *= boost_factor
                     print(f"📈 Boosted prediction for {row['date'].date()}: {forecast_df.loc[i, 'predicted_units']:.1f} BBLs")
         
-        # For intermittent deliveries, only show the top 3 most likely delivery dates
-        # Sort by predicted units and take top predictions
-        top_forecasts = forecast_df[forecast_df['predicted_units'] > 0].nlargest(3, 'predicted_units')
+        # For intermittent deliveries, find the most confident prediction and filter accordingly
+        all_predictions = forecast_df[forecast_df['predicted_units'] > 0]
+        
+        if len(all_predictions) > 0:
+            # Find the prediction with highest confidence (highest predicted units)
+            most_confident = all_predictions.loc[all_predictions['predicted_units'].idxmax()]
+            most_confident_date = most_confident['date']
+            
+            print(f"Most confident prediction: {most_confident_date.date()} with {most_confident['predicted_units']:.1f} BBLs")
+            
+            # Only show predictions on or after the most confident date
+            # This removes earlier, less confident predictions
+            top_forecasts = all_predictions[all_predictions['date'] >= most_confident_date].copy()
+            top_forecasts = top_forecasts.sort_values('date')  # Sort by date
+            
+            print(f"Filtered to {len(top_forecasts)} predictions on/after most confident date")
+        else:
+            top_forecasts = pd.DataFrame()
         
         if len(top_forecasts) > 0:
             print(f"Top {len(top_forecasts)} predicted deliveries:")
