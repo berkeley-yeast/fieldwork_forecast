@@ -470,6 +470,10 @@ class FieldworkForecaster:
         
         intervals = [(delivery_dates[i] - delivery_dates[i-1]).days for i in range(1, len(delivery_dates))]
         
+        # Calculate average delivery size
+        delivery_sizes = ts_data[ts_data['by_units'] > 0]['by_units'].values
+        avg_delivery_size = np.mean(delivery_sizes)
+        
         stats = {
             'avg_interval': np.mean(intervals),
             'std_interval': np.std(intervals),
@@ -477,10 +481,12 @@ class FieldworkForecaster:
             'max_interval': np.max(intervals),
             'median_interval': np.median(intervals),
             'total_deliveries': len(delivery_dates),
-            'last_delivery_date': delivery_dates[-1]
+            'last_delivery_date': delivery_dates[-1],
+            'avg_delivery_size': avg_delivery_size
         }
         
         print(f"• Average interval: {stats['avg_interval']:.1f} ± {stats['std_interval']:.1f} days")
+        print(f"• Average delivery size: {avg_delivery_size:.1f} BBLs")
         print(f"• Range: {stats['min_interval']} to {stats['max_interval']} days")
         print(f"• Median: {stats['median_interval']:.1f} days")
         print(f"• Last delivery: {stats['last_delivery_date'].date()}")
@@ -726,7 +732,7 @@ Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
             return None
     
     def write_forecast_to_sheets(self, forecast_df, next_delivery_date, delivery_stats, group_name='Overall'):
-        """Write forecast results to Google Sheets"""
+        """Write simplified forecast results to Google Sheets"""
         print("\nWriting forecast to Google Sheets...")
         
         try:
@@ -741,10 +747,9 @@ Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
                 import time
                 time.sleep(1)
             
-            # Write headers
-            headers = ['Forecast Date', 'Predicted Units', 'Lower Bound', 'Upper Bound',
-                      'Confidence', 'Group', 'Generated On', 'Next Delivery', 'Days Until']
-            worksheet.update('F1:N1', [headers])
+            # Simplified headers
+            headers = ['Next Delivery Date', 'Strain Type', 'Predicted Units (BBLs)', 'Confidence Interval (Lower-Upper)']
+            worksheet.update('F1:I1', [headers])
             
             # Filter forecast to only include deliveries >= 100 BBLs
             if len(forecast_df) > 0:
@@ -753,73 +758,46 @@ Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
             else:
                 significant_forecasts = forecast_df
             
-            # Prepare forecast data
-            forecast_data = []
+            # Write only the NEXT delivery (earliest date with ≥100 BBLs)
             if len(significant_forecasts) > 0:
-                for _, row in significant_forecasts.iterrows():
-                    days_until = (row['date'].date() - self.today).days
-                    forecast_data.append([
-                        row['date'].strftime('%Y-%m-%d'),
-                        f"{row['predicted_units']:.1f}",
-                        f"{row['lower_bound']:.1f}",
-                        f"{row['upper_bound']:.1f}",
-                        f"{row['confidence']:.2f}",
-                        group_name,
-                        self.today.strftime('%Y-%m-%d'),
-                        next_delivery_date.strftime('%Y-%m-%d') if next_delivery_date else 'TBD',
-                        str(days_until) if next_delivery_date else 'TBD'
-                    ])
+                # Get the earliest significant delivery
+                next_forecast = significant_forecasts.sort_values('date').iloc[0]
                 
-                end_row = len(forecast_data) + 1
-                worksheet.update(f'F2:N{end_row}', forecast_data)
+                strain_type = next_forecast.get('group_name', group_name)
+                confidence_interval = f"{next_forecast['lower_bound']:.1f} - {next_forecast['upper_bound']:.1f}"
+                
+                forecast_data = [[
+                    next_forecast['date'].strftime('%Y-%m-%d'),
+                    strain_type,
+                    f"{next_forecast['predicted_units']:.1f}",
+                    confidence_interval
+                ]]
+                
+                worksheet.update('F2:I2', forecast_data)
+                print(f"✓ Forecast written: {next_forecast['date'].date()} - {strain_type} - {next_forecast['predicted_units']:.1f} BBLs")
             else:
                 # No significant forecasts (≥100 BBLs)
-                print("No forecasts ≥100 BBLs - writing status message only")
-                status_msg = "No deliveries ≥100 BBLs predicted in next 4 weeks"
-                status_data = [[status_msg, '', '', '', '', group_name,
-                              self.today.strftime('%Y-%m-%d'), '', '']]
-                worksheet.update('F2:N2', status_data)
+                print("No forecasts ≥100 BBLs - checking pattern-based prediction")
                 
-                # Write next expected delivery based on pattern (below the status)
-                if next_delivery_date:
-                    next_del_headers = ['Next Expected Delivery', 'Date', 'Days Until', 'Method']
-                    worksheet.update('F4:I4', [next_del_headers])
+                if next_delivery_date and delivery_stats:
+                    # Use pattern-based prediction
+                    avg_units = delivery_stats.get('avg_delivery_size', 100)
+                    confidence_interval = f"{avg_units*0.85:.1f} - {avg_units*1.15:.1f}"
                     
-                    days_until = (next_delivery_date.date() - self.today).days
-                    next_del_data = [['(Based on historical pattern)', 
-                                     next_delivery_date.strftime('%Y-%m-%d'),
-                                     str(days_until),
-                                     'Pattern Analysis']]
-                    worksheet.update('F5:I5', next_del_data)
-            
-            # Write validation metrics if available
-            if self.validation_metrics:
-                metrics_row = len(forecast_data) + 3
-                metrics_headers = ['Metric', 'Value']
-                worksheet.update(f'F{metrics_row}:G{metrics_row}', [metrics_headers])
-                
-                metrics_data = [
-                    ['MAE (BBLs)', f"{self.validation_metrics['MAE']:.2f}"],
-                    ['RMSE (BBLs)', f"{self.validation_metrics['RMSE']:.2f}"],
-                    ['Accuracy (%)', f"{self.validation_metrics['accuracy']*100:.1f}"]
-                ]
-                worksheet.update(f'F{metrics_row+1}:G{metrics_row+3}', metrics_data)
-            
-            # Write delivery statistics
-            if delivery_stats:
-                stats_row = len(forecast_data) + 7
-                stats_headers = ['Statistic', 'Value']
-                worksheet.update(f'F{stats_row}:G{stats_row}', [stats_headers])
-                
-                stats_data = [
-                    ['Avg Interval (days)', f"{delivery_stats['avg_interval']:.1f}"],
-                    ['Std Interval (days)', f"{delivery_stats['std_interval']:.1f}"],
-                    ['Min Interval (days)', str(delivery_stats['min_interval'])],
-                    ['Max Interval (days)', str(delivery_stats['max_interval'])],
-                    ['Total Deliveries', str(delivery_stats['total_deliveries'])],
-                    ['Last Delivery', delivery_stats['last_delivery_date'].strftime('%Y-%m-%d')]
-                ]
-                worksheet.update(f'F{stats_row+1}:G{stats_row+6}', stats_data)
+                    forecast_data = [[
+                        next_delivery_date.strftime('%Y-%m-%d'),
+                        group_name,
+                        f"{avg_units:.1f}",
+                        f"{confidence_interval} (Pattern-based)"
+                    ]]
+                    
+                    worksheet.update('F2:I2', forecast_data)
+                    print(f"✓ Pattern-based forecast written: {next_delivery_date.date()} - {group_name}")
+                else:
+                    # No prediction available
+                    forecast_data = [['No delivery predicted in next 4 weeks', '', '', '']]
+                    worksheet.update('F2:I2', forecast_data)
+                    print("No forecast available")
             
             print("✓ Forecast written to Google Sheets successfully")
             
