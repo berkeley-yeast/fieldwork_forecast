@@ -777,25 +777,33 @@ Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
                 print(f"✓ Forecast written: {next_forecast['date'].date()} - {strain_type} - {next_forecast['predicted_units']:.1f} BBLs")
             else:
                 # No significant forecasts (≥100 BBLs)
-                print("No forecasts ≥100 BBLs - checking pattern-based prediction")
+                print("No ML forecasts ≥100 BBLs - checking pattern-based prediction")
                 
                 if next_delivery_date and delivery_stats:
                     # Use pattern-based prediction
                     avg_units = delivery_stats.get('avg_delivery_size', 100)
-                    confidence_interval = f"{avg_units*0.85:.1f} - {avg_units*1.15:.1f}"
                     
-                    forecast_data = [[
-                        next_delivery_date.strftime('%Y-%m-%d'),
-                        group_name,
-                        f"{avg_units:.1f}",
-                        f"{confidence_interval} (Pattern-based)"
-                    ]]
-                    
-                    worksheet.update('F2:I2', forecast_data)
-                    print(f"✓ Pattern-based forecast written: {next_delivery_date.date()} - {group_name}")
+                    # Only show if pattern-based prediction is also ≥100 BBLs
+                    if avg_units >= 100:
+                        confidence_interval = f"{avg_units*0.85:.1f} - {avg_units*1.15:.1f}"
+                        
+                        forecast_data = [[
+                            next_delivery_date.strftime('%Y-%m-%d'),
+                            group_name,
+                            f"{avg_units:.1f}",
+                            f"{confidence_interval} (Pattern-based)"
+                        ]]
+                        
+                        worksheet.update('F2:I2', forecast_data)
+                        print(f"✓ Pattern-based forecast written: {next_delivery_date.date()} - {group_name} - {avg_units:.1f} BBLs")
+                    else:
+                        # Pattern-based prediction also below 100 BBLs
+                        forecast_data = [['No delivery ≥100 BBLs predicted', '', '', '']]
+                        worksheet.update('F2:I2', forecast_data)
+                        print(f"Pattern-based prediction ({avg_units:.1f} BBLs) also below 100 BBL threshold")
                 else:
                     # No prediction available
-                    forecast_data = [['No delivery predicted in next 4 weeks', '', '', '']]
+                    forecast_data = [['No delivery ≥100 BBLs predicted', '', '', '']]
                     worksheet.update('F2:I2', forecast_data)
                     print("No forecast available")
             
