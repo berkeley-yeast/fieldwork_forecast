@@ -227,6 +227,15 @@ class FieldworkForecaster:
         df = df.dropna(subset=['date'])
         df['by_units'] = pd.to_numeric(df['by_units'], errors='coerce')
         df = df.dropna(subset=['by_units'])
+        
+        # Remove future dates (data quality issue)
+        future_dates = df[df['date'].dt.date > self.today]
+        if len(future_dates) > 0:
+            print(f"⚠️ WARNING: Found {len(future_dates)} records with future dates, removing them:")
+            for _, row in future_dates.head(5).iterrows():
+                print(f"  - {row['date'].date()}: {row['by_units']} BBLs ({row['strain']})")
+            df = df[df['date'].dt.date <= self.today]
+        
         df = df.sort_values('date')
         
         # Data quality checks
@@ -241,6 +250,8 @@ class FieldworkForecaster:
         print(f"• Days since last data: {days_since_last_data}")
         if days_since_last_data > 60:
             print(f"  ⚠️ WARNING: Data is stale ({days_since_last_data} days old)")
+        elif days_since_last_data < 0:
+            print(f"  ⚠️ ERROR: Future dates detected but not filtered properly!")
         
         # Encode categorical variables
         self.strain_encoder = LabelEncoder()
@@ -762,12 +773,24 @@ Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
                 end_row = len(forecast_data) + 1
                 worksheet.update(f'F2:N{end_row}', forecast_data)
             else:
-                # No forecasts
-                status_data = [['No deliveries predicted', '', '', '', '', group_name,
-                              self.today.strftime('%Y-%m-%d'),
-                              next_delivery_date.strftime('%Y-%m-%d') if next_delivery_date else 'TBD',
-                              str((next_delivery_date.date() - self.today).days) if next_delivery_date else 'TBD']]
+                # No significant forecasts (≥100 BBLs)
+                print("No forecasts ≥100 BBLs - writing status message only")
+                status_msg = "No deliveries ≥100 BBLs predicted in next 4 weeks"
+                status_data = [[status_msg, '', '', '', '', group_name,
+                              self.today.strftime('%Y-%m-%d'), '', '']]
                 worksheet.update('F2:N2', status_data)
+                
+                # Write next expected delivery based on pattern (below the status)
+                if next_delivery_date:
+                    next_del_headers = ['Next Expected Delivery', 'Date', 'Days Until', 'Method']
+                    worksheet.update('F4:I4', [next_del_headers])
+                    
+                    days_until = (next_delivery_date.date() - self.today).days
+                    next_del_data = [['(Based on historical pattern)', 
+                                     next_delivery_date.strftime('%Y-%m-%d'),
+                                     str(days_until),
+                                     'Pattern Analysis']]
+                    worksheet.update('F5:I5', next_del_data)
             
             # Write validation metrics if available
             if self.validation_metrics:
