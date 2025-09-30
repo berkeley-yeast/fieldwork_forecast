@@ -84,22 +84,38 @@ Ensure the service account email has **Editor** access to the "large_account_na_
 ## Model Details
 
 ### Forecasting Approach
-- **Algorithm**: LightGBM with skforecast wrapper
-- **Features**: 
-  - Lag features (1, 2, 3, 7, 14, 21, 28 days)
-  - Seasonal features (day of week, month, quarter)
-  - Rolling averages (7, 14 days)
-  - Strain encoding
-- **Forecast Horizon**: 14 days (2 weeks)
-- **Hyperparameter Optimization**: Grid search with cross-validation
+The system uses an **ensemble approach** optimized for intermittent demand:
+
+1. **Croston's Method (SBA variant)** - Specialized statistical method for sparse/intermittent demand patterns
+2. **Machine Learning Models**:
+   - Gradient Boosting Regressor for delivery probability
+   - Gradient Boosting Regressor for delivery size estimation
+3. **Pattern-based Analysis** - Historical interval analysis as backup
+
+**Ensemble Weighting**: Croston's (40%) + ML (40%) + Pattern (20%)
+
+### Features
+- **Time-based**: day of week, month, quarter, month-end/start indicators
+- **Trend**: days since last delivery (critical for intermittent forecasting)
+- **Rolling averages**: 7, 14, 28-day windows
+- **Categorical**: strain and strain_type encoding
+
+### Forecast Horizon
+28 days (4 weeks) with confidence intervals (±15%)
+
+### Model Validation
+- Time series cross-validation (80/20 split)
+- Metrics tracked: MAE, RMSE, delivery detection accuracy
+- Results written to Google Sheets for monitoring
 
 ### Model Training
 The model automatically:
 1. Handles missing dates by filling with zeros
 2. Creates daily aggregations from the raw data
 3. Generates time-based features for seasonality
-4. Optimizes hyperparameters using grid search
+4. Detects intermittency patterns and applies appropriate methods
 5. Validates using time series cross-validation
+6. Provides confidence scores and prediction intervals
 
 ## Automation Schedule
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fieldwork Delivery Forecasting Script
-Uses skforecast with LightGBM for complex seasonality and exogenous trends
+Implements Croston's method and ML ensemble for intermittent demand forecasting
 Integrates with Google Sheets API for data input/output
 """
 
@@ -17,23 +17,19 @@ warnings.filterwarnings('ignore')
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Forecasting libraries
-from skforecast.recursive import ForecasterRecursive
-from skforecast.model_selection import grid_search_forecaster
-import lightgbm as lgb
-
 # Data processing
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, accuracy_score
+from sklearn.model_selection import TimeSeriesSplit
 
 # Visualization
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend for GitHub Actions
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import seaborn as sns
 
-# Set style safely
 try:
     plt.style.use('seaborn-v0_8')
 except:
@@ -42,22 +38,88 @@ except:
     except:
         plt.style.use('default')
 
-import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+
+
+class CrostonsMethod:
+    """Croston's Method for intermittent demand forecasting"""
+    
+    def __init__(self, alpha=0.1, method='croston'):
+        """
+        Initialize Croston's method
+        
+        Parameters:
+        - alpha: smoothing parameter (0-1)
+        - method: 'croston', 'sba' (Syntetos-Boylan Approximation), or 'tsb' (Teunter-Syntetos-Babai)
+        """
+        self.alpha = alpha
+        self.method = method
+        self.demand_size = None
+        self.demand_interval = None
+        
+    def fit(self, series):
+        """Fit Croston's method on historical data"""
+        # Extract non-zero demands
+        non_zero_indices = np.where(series > 0)[0]
+        
+        if len(non_zero_indices) < 2:
+            # Not enough data for Croston's method
+            self.demand_size = series[series > 0].mean() if len(series[series > 0]) > 0 else 0
+            self.demand_interval = len(series) / max(1, len(non_zero_indices))
+            return self
+        
+        # Initialize with first demand
+        demand_sizes = series[non_zero_indices]
+        
+        # Calculate intervals between demands
+        intervals = np.diff(non_zero_indices)
+        
+        # Exponential smoothing on demand sizes
+        smoothed_size = demand_sizes[0]
+        for size in demand_sizes[1:]:
+            smoothed_size = self.alpha * size + (1 - self.alpha) * smoothed_size
+        
+        # Exponential smoothing on intervals
+        smoothed_interval = intervals[0]
+        for interval in intervals[1:]:
+            smoothed_interval = self.alpha * interval + (1 - self.alpha) * smoothed_interval
+        
+        self.demand_size = smoothed_size
+        self.demand_interval = smoothed_interval
+        
+        return self
+    
+    def predict(self, steps=1):
+        """Predict future demand"""
+        if self.demand_size is None or self.demand_interval is None:
+            return np.zeros(steps)
+        
+        if self.method == 'croston':
+            # Standard Croston's: forecast = size / interval
+            forecast_value = self.demand_size / max(1, self.demand_interval)
+        elif self.method == 'sba':
+            # Syntetos-Boylan Approximation (less biased)
+            forecast_value = (self.demand_size / max(1, self.demand_interval)) * (1 - self.alpha/2)
+        else:  # tsb
+            # TSB method
+            prob_demand = 1 / max(1, self.demand_interval)
+            forecast_value = prob_demand * self.demand_size
+        
+        return np.full(steps, forecast_value)
+
 
 class FieldworkForecaster:
     def __init__(self, google_creds_path=None):
         """Initialize the forecaster with Google Sheets credentials"""
         self.sheet_name = "large_account_na_data"
         self.tab_name = "Fieldwork"
-        self.forecast_horizon = 28  # 4 weeks (more reasonable for stable predictions)
+        self.forecast_horizon = 28
         self.today = datetime.now().date()
+        self.validation_metrics = {}
         
-        # Google Sheets setup
         if google_creds_path:
             self.setup_google_sheets(google_creds_path)
         else:
-            # For GitHub Actions, use environment variable
             creds_json = os.environ.get('GOOGLE_SHEETS_CREDENTIALS')
             if creds_json:
                 creds_dict = json.loads(creds_json)
@@ -71,7 +133,6 @@ class FieldworkForecaster:
             "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive"
         ]
-        
         creds = Credentials.from_service_account_file(creds_path, scopes=scope)
         self.gc = gspread.authorize(creds)
         
@@ -81,7 +142,6 @@ class FieldworkForecaster:
             "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive"
         ]
-        
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         self.gc = gspread.authorize(creds)
     
@@ -90,22 +150,18 @@ class FieldworkForecaster:
         print(f"Loading data from Google Sheet: {self.sheet_name}, Tab: {self.tab_name}")
         
         try:
-            # Open the spreadsheet and worksheet
             sheet = self.gc.open(self.sheet_name)
             worksheet = sheet.worksheet(self.tab_name)
             
-            # Get all values with expected headers to handle duplicates
             try:
                 data = worksheet.get_all_records()
             except gspread.exceptions.GSpreadException as e:
                 if "duplicates" in str(e):
-                    print("Handling duplicate headers in worksheet...")
-                    # Get raw data and create our own headers
+                    print("Handling duplicate headers...")
                     all_values = worksheet.get_all_values()
                     if not all_values:
                         raise ValueError("No data found in worksheet")
                     
-                    # Use first row as headers, but make them unique
                     headers = all_values[0]
                     unique_headers = []
                     header_counts = {}
@@ -118,11 +174,9 @@ class FieldworkForecaster:
                             header_counts[header] = 0
                             unique_headers.append(header)
                     
-                    # Create dataframe manually
-                    data_rows = all_values[1:]  # Skip header row
+                    data_rows = all_values[1:]
                     data = []
                     for row in data_rows:
-                        # Pad row with empty strings if shorter than headers
                         padded_row = row + [''] * (len(unique_headers) - len(row))
                         data.append(dict(zip(unique_headers, padded_row)))
                 else:
@@ -133,8 +187,6 @@ class FieldworkForecaster:
             
             df = pd.DataFrame(data)
             print(f"Loaded {len(df)} rows of data")
-            print(f"Columns: {df.columns.tolist()}")
-            
             return df
             
         except Exception as e:
@@ -142,52 +194,27 @@ class FieldworkForecaster:
             raise
     
     def preprocess_data(self, df):
-        """Preprocess the data for forecasting"""
+        """Preprocess the data for forecasting with quality checks"""
         print("Preprocessing data...")
         
-        # Find the required columns (they might have different names or duplicates)
         print(f"Available columns: {df.columns.tolist()}")
         
-        # Try to find date column
-        date_col = None
-        for col in df.columns:
-            if 'date' in col.lower():
-                date_col = col
-                break
+        # Find required columns
+        date_col = next((col for col in df.columns if 'date' in col.lower()), None)
+        units_col = next((col for col in df.columns if 'by_units' in col.lower() or 'units' in col.lower()), None)
+        strain_col = next((col for col in df.columns if 'strain' in col.lower() and 'type' not in col.lower()), None)
+        strain_type_col = next((col for col in df.columns if 'strain_type' in col.lower()), None)
         
-        # Try to find units column  
-        units_col = None
-        for col in df.columns:
-            if 'by_units' in col.lower() or 'units' in col.lower():
-                units_col = col
-                break
-        
-        # Try to find strain column
-        strain_col = None
-        for col in df.columns:
-            if 'strain' in col.lower() and 'type' not in col.lower():
-                strain_col = col
-                break
-        
-        # Try to find strain_type column
-        strain_type_col = None
-        for col in df.columns:
-            if 'strain_type' in col.lower():
-                strain_type_col = col
-                break
-        
-        if not date_col:
-            raise ValueError(f"Could not find date column in: {df.columns.tolist()}")
-        if not units_col:
-            raise ValueError(f"Could not find units column in: {df.columns.tolist()}")
-        if not strain_col:
-            raise ValueError(f"Could not find strain column in: {df.columns.tolist()}")
-        if not strain_type_col:
-            raise ValueError(f"Could not find strain_type column in: {df.columns.tolist()}")
+        if not all([date_col, units_col, strain_col, strain_type_col]):
+            missing = []
+            if not date_col: missing.append('date')
+            if not units_col: missing.append('units')
+            if not strain_col: missing.append('strain')
+            if not strain_type_col: missing.append('strain_type')
+            raise ValueError(f"Missing required columns: {missing}")
         
         print(f"Using columns - Date: {date_col}, Units: {units_col}, Strain: {strain_col}, Strain Type: {strain_type_col}")
         
-        # Rename columns to standard names
         df = df.rename(columns={
             date_col: 'date',
             units_col: 'by_units', 
@@ -195,49 +222,46 @@ class FieldworkForecaster:
             strain_type_col: 'strain_type'
         })
         
-        # Convert date column to datetime
+        # Convert and clean data
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        
-        # Remove rows with invalid dates
         df = df.dropna(subset=['date'])
-        
-        # Convert by_units to numeric
         df['by_units'] = pd.to_numeric(df['by_units'], errors='coerce')
-        
-        # Remove rows with invalid units
         df = df.dropna(subset=['by_units'])
-        
-        # Sort by date
         df = df.sort_values('date')
         
-        # Create strain encoding for exogenous variables
+        # Data quality checks
+        print("\n📊 Data Quality Report:")
+        print(f"• Date range: {df['date'].min().date()} to {df['date'].max().date()}")
+        print(f"• Total records: {len(df)}")
+        print(f"• Unique strains: {df['strain'].nunique()}")
+        print(f"• Unique strain types: {df['strain_type'].nunique()}")
+        
+        # Check data recency
+        days_since_last_data = (self.today - df['date'].max().date()).days
+        print(f"• Days since last data: {days_since_last_data}")
+        if days_since_last_data > 60:
+            print(f"  ⚠️ WARNING: Data is stale ({days_since_last_data} days old)")
+        
+        # Encode categorical variables
         self.strain_encoder = LabelEncoder()
         df['strain_encoded'] = self.strain_encoder.fit_transform(df['strain'].astype(str))
         
-        # Create strain_type encoding for exogenous variables
         self.strain_type_encoder = LabelEncoder()
         df['strain_type_encoded'] = self.strain_type_encoder.fit_transform(df['strain_type'].astype(str))
-        
-        print(f"Data preprocessed: {len(df)} valid rows")
-        print(f"Date range: {df['date'].min()} to {df['date'].max()}")
-        print(f"Unique strains: {df['strain'].nunique()}")
-        print(f"Unique strain types: {df['strain_type'].nunique()}")
         
         return df
     
     def create_time_series(self, df):
-        """Create time series with proper frequency and exogenous variables"""
+        """Create time series with proper frequency and features"""
         print("Creating time series...")
         
-        # Set date as index, but first handle any duplicate dates
         df = df.set_index('date')
         
-        # Remove duplicate indices by keeping the first occurrence
         if df.index.duplicated().any():
-            print(f"Found {df.index.duplicated().sum()} duplicate dates, keeping first occurrence")
+            print(f"Found {df.index.duplicated().sum()} duplicate dates, aggregating...")
             df = df[~df.index.duplicated(keep='first')]
         
-        # Aggregate by date (sum units, mode for strain and strain_type)
+        # Aggregate by date
         daily_data = df.groupby(df.index.date).agg({
             'by_units': 'sum',
             'strain_encoded': lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else 0,
@@ -251,937 +275,623 @@ class FieldworkForecaster:
             freq='D'
         )
         
-        # Reindex to fill missing dates
         daily_data = daily_data.reindex(full_range, fill_value=0)
         
-        # Add comprehensive time-based features for seasonality
+        # Add time-based features
         daily_data['day_of_week'] = daily_data.index.dayofweek
         daily_data['day_of_month'] = daily_data.index.day
         daily_data['month'] = daily_data.index.month
         daily_data['quarter'] = daily_data.index.quarter
-        
-        # Add holiday and special date features
         daily_data['is_month_end'] = (daily_data.index.day >= 28).astype(int)
         daily_data['is_month_start'] = (daily_data.index.day <= 3).astype(int)
         daily_data['is_quarter_end'] = daily_data.index.to_series().apply(
             lambda x: 1 if x.month in [3, 6, 9, 12] and x.day >= 28 else 0
         ).values
         
-        # Add days since last delivery feature (trend)
+        # Days since last delivery - critical for intermittent forecasting
         last_delivery_idx = daily_data[daily_data['by_units'] > 0].index
+        daily_data['days_since_last_delivery'] = 0
         if len(last_delivery_idx) > 0:
-            daily_data['days_since_last_delivery'] = 0
             for i, date in enumerate(daily_data.index):
-                if len(last_delivery_idx[last_delivery_idx <= date]) > 0:
-                    last_delivery = last_delivery_idx[last_delivery_idx <= date][-1]
-                    daily_data.loc[date, 'days_since_last_delivery'] = (date - last_delivery).days
+                prev_deliveries = last_delivery_idx[last_delivery_idx < date]
+                if len(prev_deliveries) > 0:
+                    daily_data.loc[date, 'days_since_last_delivery'] = (date - prev_deliveries[-1]).days
                 else:
-                    daily_data.loc[date, 'days_since_last_delivery'] = 999  # No prior delivery
+                    daily_data.loc[date, 'days_since_last_delivery'] = 999
         else:
             daily_data['days_since_last_delivery'] = 999
         
-        # Add rolling averages (but not manual lags since ForecasterRecursive handles those)
-        daily_data['rolling_7'] = daily_data['by_units'].rolling(7).mean()
-        daily_data['rolling_14'] = daily_data['by_units'].rolling(14).mean()
-        
-        # Drop initial NaN values from rolling averages
-        daily_data = daily_data.dropna()
+        # Rolling features (handle NaNs)
+        daily_data['rolling_7'] = daily_data['by_units'].rolling(7, min_periods=1).mean()
+        daily_data['rolling_14'] = daily_data['by_units'].rolling(14, min_periods=1).mean()
+        daily_data['rolling_28'] = daily_data['by_units'].rolling(28, min_periods=1).mean()
         
         print(f"Time series created with {len(daily_data)} daily observations")
         
+        # Analyze intermittency
+        zero_days = (daily_data['by_units'] == 0).sum()
+        delivery_days = (daily_data['by_units'] > 0).sum()
+        intermittency_rate = zero_days / len(daily_data)
+        
+        print(f"\n📊 Intermittency Analysis:")
+        print(f"• Zero delivery days: {zero_days} ({intermittency_rate*100:.1f}%)")
+        print(f"• Delivery days: {delivery_days} ({(1-intermittency_rate)*100:.1f}%)")
+        print(f"• Average delivery size: {daily_data[daily_data['by_units'] > 0]['by_units'].mean():.1f} BBLs")
+        
+        if intermittency_rate > 0.75:
+            print(f"  ✓ High intermittency detected - Croston's method recommended")
+        
         return daily_data
     
-    def train_intermittent_forecaster(self, ts_data):
-        """Train an intermittent demand forecasting model"""
-        print("Training intermittent demand forecaster...")
+    def train_ensemble_forecaster(self, ts_data):
+        """Train ensemble forecaster combining Croston's and ML models"""
+        print("\nTraining ensemble forecaster...")
         
-        # Intermittent forecasting approach:
-        # 1. Model probability of delivery occurring (binary classification)
-        # 2. Model delivery size when it occurs (regression on non-zero values)
-        
-        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-        from sklearn.linear_model import LogisticRegression
-        
-        # Prepare comprehensive features for intermittent forecasting
         exog_vars = [
             'strain_encoded', 'strain_type_encoded', 'day_of_week', 'day_of_month', 
-            'month', 'quarter', 'rolling_7', 'rolling_14',
+            'month', 'quarter', 'rolling_7', 'rolling_14', 'rolling_28',
             'is_month_end', 'is_month_start', 'is_quarter_end',
             'days_since_last_delivery'
         ]
         
-        # Store the training feature order for later use in prediction
+        # Ensure all features exist
+        missing_features = set(exog_vars) - set(ts_data.columns)
+        if missing_features:
+            print(f"⚠️ Missing features: {missing_features}")
+            exog_vars = [f for f in exog_vars if f in ts_data.columns]
+        
         self.training_features = exog_vars
         
-        # Create binary target (delivery vs no delivery)
+        # Model 1: Croston's Method (specialized for intermittent demand)
+        print("Training Croston's method...")
+        self.croston_model = CrostonsMethod(alpha=0.2, method='sba')
+        self.croston_model.fit(ts_data['by_units'].values)
+        
+        # Model 2: Delivery probability classifier
+        print("Training delivery probability model...")
         ts_data['has_delivery'] = (ts_data['by_units'] > 0).astype(int)
         
-        # Model 1: Probability of delivery occurring
-        print("Training delivery probability model...")
-        self.delivery_probability_model = LogisticRegression(
+        self.delivery_probability_model = GradientBoostingRegressor(
+            n_estimators=50,
+            max_depth=4,
+            learning_rate=0.1,
             random_state=42,
-            max_iter=1000
+            subsample=0.8
         )
         
-        # Model 2: Delivery size when it occurs
+        # Model 3: Delivery size regressor
         print("Training delivery size model...")
         delivery_data = ts_data[ts_data['by_units'] > 0].copy()
         
-        if len(delivery_data) > 0:
-            self.delivery_size_model = RandomForestRegressor(
-                n_estimators=30,
-                max_depth=3,
-                min_samples_split=5,
-                random_state=42
-            )
-            
-            # Check available features in training data
-            print(f"Available features in ts_data: {list(ts_data.columns)}")
-            print(f"Required features: {exog_vars}")
-            
-            # Check for missing features in training data
-            missing_in_training = set(exog_vars) - set(ts_data.columns)
-            if missing_in_training:
-                print(f"Missing features in training data: {missing_in_training}")
-                # Remove missing features from the list
-                exog_vars = [f for f in exog_vars if f in ts_data.columns]
-                self.training_features = exog_vars
-                print(f"Updated feature list: {exog_vars}")
-            
-            # Fit probability model on all data
-            X_prob = ts_data[exog_vars]
+        if len(delivery_data) >= 5:
+            X_prob = ts_data[exog_vars].fillna(0)
             y_prob = ts_data['has_delivery']
+            
+            # Use probability as continuous target (better for small datasets)
             self.delivery_probability_model.fit(X_prob, y_prob)
             
-            # Fit size model on delivery days only
-            X_size = delivery_data[exog_vars]
+            # Train size model
+            self.delivery_size_model = GradientBoostingRegressor(
+                n_estimators=50,
+                max_depth=3,
+                learning_rate=0.1,
+                random_state=42,
+                subsample=0.8
+            )
+            
+            X_size = delivery_data[exog_vars].fillna(0)
             y_size = delivery_data['by_units']
             self.delivery_size_model.fit(X_size, y_size)
             
-            print(f"Models trained on {len(ts_data)} total days, {len(delivery_data)} delivery days")
-            print(f"Delivery probability: {len(delivery_data)/len(ts_data)*100:.1f}% of days")
+            # Validate models with time series split
+            self._validate_models(ts_data, exog_vars)
             
+            print(f"✓ Models trained on {len(ts_data)} days, {len(delivery_data)} delivery days")
         else:
-            print("No delivery data found for training size model")
+            print(f"⚠️ Insufficient delivery data ({len(delivery_data)} days), using Croston's only")
             self.delivery_size_model = None
         
         return ts_data
     
-    def make_forecast(self, ts_data):
-        """Generate forecast for the next 4 weeks from today's date"""
-        print(f"Generating {self.forecast_horizon}-day forecast from today ({self.today})...")
+    def _validate_models(self, ts_data, exog_vars):
+        """Validate model performance using time series cross-validation"""
+        print("\nValidating models...")
         
-        # Calculate forecast dates starting from tomorrow (not today)
+        delivery_data = ts_data[ts_data['by_units'] > 0]
+        if len(delivery_data) < 10:
+            print("Insufficient data for validation")
+            return
+        
+        # Use last 20% for validation
+        split_idx = int(len(ts_data) * 0.8)
+        train_data = ts_data.iloc[:split_idx]
+        test_data = ts_data.iloc[split_idx:]
+        
+        if len(test_data[test_data['by_units'] > 0]) < 2:
+            print("Insufficient validation data")
+            return
+        
+        # Validate on test set
+        X_test = test_data[exog_vars].fillna(0)
+        y_test_binary = test_data['has_delivery']
+        y_test_size = test_data['by_units']
+        
+        # Probability predictions
+        prob_pred = self.delivery_probability_model.predict(X_test)
+        prob_pred_binary = (prob_pred > 0.5).astype(int)
+        
+        # Size predictions
+        if self.delivery_size_model:
+            size_pred = self.delivery_size_model.predict(X_test)
+            size_pred = np.maximum(size_pred, 0)
+            
+            # Combined forecast
+            combined_pred = prob_pred_binary * size_pred
+            
+            # Calculate metrics for delivery days only
+            delivery_mask = y_test_binary == 1
+            if delivery_mask.sum() > 0:
+                mae = mean_absolute_error(y_test_size[delivery_mask], combined_pred[delivery_mask])
+                rmse = np.sqrt(mean_squared_error(y_test_size[delivery_mask], combined_pred[delivery_mask]))
+                
+                self.validation_metrics = {
+                    'MAE': mae,
+                    'RMSE': rmse,
+                    'accuracy': accuracy_score(y_test_binary, prob_pred_binary),
+                    'test_size': len(test_data),
+                    'delivery_days': delivery_mask.sum()
+                }
+                
+                print(f"📈 Validation Metrics:")
+                print(f"• MAE (delivery days): {mae:.2f} BBLs")
+                print(f"• RMSE (delivery days): {rmse:.2f} BBLs")
+                print(f"• Delivery detection accuracy: {self.validation_metrics['accuracy']*100:.1f}%")
+    
+    def calculate_delivery_statistics(self, ts_data):
+        """Calculate statistics about delivery patterns"""
+        print("\nCalculating delivery statistics...")
+        
+        delivery_dates = ts_data[ts_data['by_units'] > 0].index.tolist()
+        
+        if len(delivery_dates) < 2:
+            print("Not enough delivery dates for statistics")
+            return None
+        
+        intervals = [(delivery_dates[i] - delivery_dates[i-1]).days for i in range(1, len(delivery_dates))]
+        
+        stats = {
+            'avg_interval': np.mean(intervals),
+            'std_interval': np.std(intervals),
+            'min_interval': np.min(intervals),
+            'max_interval': np.max(intervals),
+            'median_interval': np.median(intervals),
+            'total_deliveries': len(delivery_dates),
+            'last_delivery_date': delivery_dates[-1]
+        }
+        
+        print(f"• Average interval: {stats['avg_interval']:.1f} ± {stats['std_interval']:.1f} days")
+        print(f"• Range: {stats['min_interval']} to {stats['max_interval']} days")
+        print(f"• Median: {stats['median_interval']:.1f} days")
+        print(f"• Last delivery: {stats['last_delivery_date'].date()}")
+        
+        return stats
+    
+    def make_forecast(self, ts_data, delivery_stats):
+        """Generate forecast using ensemble approach"""
+        print(f"\nGenerating {self.forecast_horizon}-day ensemble forecast...")
+        
         tomorrow = self.today + timedelta(days=1)
         forecast_start = datetime.combine(tomorrow, datetime.min.time())
-        forecast_dates = pd.date_range(
-            start=forecast_start,
-            periods=self.forecast_horizon,
-            freq='D'
-        )
+        forecast_dates = pd.date_range(start=forecast_start, periods=self.forecast_horizon, freq='D')
         
-        # Calculate how many days to forecast beyond the training data
-        last_data_date = ts_data.index[-1]
-        days_gap = (forecast_start.date() - last_data_date.date()).days
-        total_steps = self.forecast_horizon + max(0, days_gap)
+        # Croston's forecast
+        croston_forecast = self.croston_model.predict(steps=self.forecast_horizon)
         
-        print(f"Last data date: {last_data_date.date()}")
-        print(f"Forecast start date: {forecast_start.date()}")
-        print(f"Days gap: {days_gap}, Total steps to forecast: {total_steps}")
+        # ML forecast
+        forecast_exog = self._create_forecast_exog(ts_data, forecast_dates)
         
-        # Create exogenous variables for forecast period
-        exog_future = pd.DataFrame(index=forecast_dates)
+        ml_probabilities = None
+        ml_sizes = None
         
-        # Use last known strain and strain_type as default
-        last_strain = ts_data['strain_encoded'].iloc[-1]
-        last_strain_type = ts_data['strain_type_encoded'].iloc[-1]
-        exog_future['strain_encoded'] = last_strain
-        exog_future['strain_type_encoded'] = last_strain_type
+        if self.delivery_size_model:
+            ml_probabilities = self.delivery_probability_model.predict(forecast_exog)
+            ml_probabilities = np.clip(ml_probabilities, 0, 1)
+            ml_sizes = self.delivery_size_model.predict(forecast_exog)
+            ml_sizes = np.maximum(ml_sizes, 0)
         
-        # Time-based features
-        exog_future['day_of_week'] = exog_future.index.dayofweek
-        exog_future['day_of_month'] = exog_future.index.day
-        exog_future['month'] = exog_future.index.month
-        exog_future['quarter'] = exog_future.index.quarter
+        # Pattern-based forecast
+        pattern_forecast = self._pattern_based_forecast(ts_data, delivery_stats, forecast_dates)
         
-        # For rolling features, use recent averages as proxies
-        recent_avg_7 = ts_data['by_units'].tail(7).mean()
-        recent_avg_14 = ts_data['by_units'].tail(14).mean()
+        # Ensemble: combine all methods with weights
+        ensemble_forecast = np.zeros(self.forecast_horizon)
+        confidence_scores = np.zeros(self.forecast_horizon)
         
-        exog_future['rolling_7'] = recent_avg_7
-        exog_future['rolling_14'] = recent_avg_14
+        for i in range(self.forecast_horizon):
+            forecasts = []
+            weights = []
+            
+            # Croston's forecast (weight: 0.4 for high intermittency)
+            forecasts.append(croston_forecast[i])
+            weights.append(0.4)
+            
+            # ML forecast (weight: 0.4 if available)
+            if ml_probabilities is not None and ml_sizes is not None:
+                ml_forecast = ml_probabilities[i] * ml_sizes[i]
+                forecasts.append(ml_forecast)
+                weights.append(0.4)
+                confidence_scores[i] = ml_probabilities[i]
+            
+            # Pattern forecast (weight: 0.2)
+            forecasts.append(pattern_forecast[i])
+            weights.append(0.2)
+            
+            # Weighted average
+            weights = np.array(weights) / sum(weights)
+            ensemble_forecast[i] = np.average(forecasts, weights=weights)
         
-        # Create exogenous variables for forecast period
+        # Find predicted delivery dates (threshold-based)
+        delivery_threshold = 10  # BBLs
+        predicted_deliveries = []
+        
+        for i, (date, value, confidence) in enumerate(zip(forecast_dates, ensemble_forecast, confidence_scores)):
+            if value > delivery_threshold:
+                predicted_deliveries.append({
+                    'date': date,
+                    'predicted_units': value,
+                    'confidence': confidence if confidence > 0 else 0.5,
+                    'method': 'ensemble'
+                })
+        
+        # Calculate confidence intervals (±15%)
+        for pred in predicted_deliveries:
+            pred['lower_bound'] = pred['predicted_units'] * 0.85
+            pred['upper_bound'] = pred['predicted_units'] * 1.15
+        
+        forecast_df = pd.DataFrame(predicted_deliveries)
+        
+        # Determine next delivery date
+        next_delivery_date = None
+        if len(forecast_df) > 0:
+            # Use highest confidence prediction
+            best_pred = forecast_df.loc[forecast_df['confidence'].idxmax()]
+            next_delivery_date = best_pred['date']
+        elif delivery_stats:
+            # Fallback to pattern-based
+            expected_days = delivery_stats['avg_interval']
+            next_delivery_date = delivery_stats['last_delivery_date'] + timedelta(days=int(expected_days))
+        
+        if len(forecast_df) > 0:
+            print(f"\n🎯 Forecast Summary:")
+            print(f"• Predicted deliveries: {len(forecast_df)}")
+            print(f"• Next delivery: {next_delivery_date.date() if next_delivery_date else 'Unknown'}")
+            print(f"• Confidence: {forecast_df['confidence'].max()*100:.1f}%")
+            
+            for _, row in forecast_df.head(3).iterrows():
+                print(f"  - {row['date'].date()}: {row['predicted_units']:.1f} BBLs (±{(row['upper_bound']-row['predicted_units']):.1f})")
+        
+        return forecast_df, next_delivery_date
+    
+    def _create_forecast_exog(self, ts_data, forecast_dates):
+        """Create exogenous variables for forecast period"""
         forecast_exog = pd.DataFrame(index=forecast_dates)
         
-        # Use last known strain and strain_type as default
-        last_strain = ts_data['strain_encoded'].iloc[-1]
-        last_strain_type = ts_data['strain_type_encoded'].iloc[-1]
-        forecast_exog['strain_encoded'] = last_strain
-        forecast_exog['strain_type_encoded'] = last_strain_type
+        # Use last known strain values
+        forecast_exog['strain_encoded'] = ts_data['strain_encoded'].iloc[-1]
+        forecast_exog['strain_type_encoded'] = ts_data['strain_type_encoded'].iloc[-1]
         
-        # Time-based features
+        # Time features
         forecast_exog['day_of_week'] = forecast_exog.index.dayofweek
         forecast_exog['day_of_month'] = forecast_exog.index.day
         forecast_exog['month'] = forecast_exog.index.month
         forecast_exog['quarter'] = forecast_exog.index.quarter
-        
-        # Special date features
         forecast_exog['is_month_end'] = (forecast_exog.index.day >= 28).astype(int)
         forecast_exog['is_month_start'] = (forecast_exog.index.day <= 3).astype(int)
         forecast_exog['is_quarter_end'] = forecast_exog.index.to_series().apply(
             lambda x: 1 if x.month in [3, 6, 9, 12] and x.day >= 28 else 0
         ).values
         
-        # Days since last delivery (critical for intermittent forecasting)
-        last_delivery_date = ts_data[ts_data['by_units'] > 0].index[-1] if len(ts_data[ts_data['by_units'] > 0]) > 0 else ts_data.index[0]
-        forecast_exog['days_since_last_delivery'] = [(date - last_delivery_date).days for date in forecast_exog.index]
+        # Days since last delivery
+        last_delivery = ts_data[ts_data['by_units'] > 0].index[-1] if len(ts_data[ts_data['by_units'] > 0]) > 0 else ts_data.index[0]
+        forecast_exog['days_since_last_delivery'] = [(date - last_delivery).days for date in forecast_exog.index]
         
-        # For rolling features, use recent averages as proxies
-        recent_avg_7 = ts_data['by_units'].tail(7).mean()
-        recent_avg_14 = ts_data['by_units'].tail(14).mean()
-        forecast_exog['rolling_7'] = recent_avg_7
-        forecast_exog['rolling_14'] = recent_avg_14
-
-        # Generate intermittent forecast
-        print("Generating intermittent demand forecast...")
+        # Rolling features (use recent averages)
+        forecast_exog['rolling_7'] = ts_data['by_units'].tail(7).mean()
+        forecast_exog['rolling_14'] = ts_data['by_units'].tail(14).mean()
+        forecast_exog['rolling_28'] = ts_data['by_units'].tail(28).mean()
         
-        # Ensure forecast features match training features exactly
-        print(f"Training features: {self.training_features}")
-        print(f"Forecast features: {list(forecast_exog.columns)}")
-        
-        # Check for missing features
-        missing_features = set(self.training_features) - set(forecast_exog.columns)
-        if missing_features:
-            print(f"Missing features in forecast data: {missing_features}")
-            raise ValueError(f"Missing features: {missing_features}")
-        
-        # Reorder forecast features to match training order
+        # Ensure feature order matches training
         forecast_exog = forecast_exog[self.training_features]
+        forecast_exog = forecast_exog.fillna(0)
         
-        # Step 1: Predict probability of delivery for each day
-        delivery_probabilities = self.delivery_probability_model.predict_proba(forecast_exog)[:, 1]
-        
-        # Step 2: Predict delivery sizes
-        if self.delivery_size_model is not None:
-            delivery_sizes = self.delivery_size_model.predict(forecast_exog)
-            delivery_sizes = np.maximum(delivery_sizes, 0)  # Ensure non-negative
-        else:
-            # Fallback: use historical average
-            historical_avg = ts_data[ts_data['by_units'] > 0]['by_units'].mean()
-            delivery_sizes = np.full(len(forecast_dates), historical_avg)
-        
-        # Step 3: Combine probability and size to get expected delivery
-        # Use a more conservative threshold for intermittent deliveries
-        probability_threshold = 0.1  # Lower threshold but still selective
-        
-        forecast_values = []
-        for i, (prob, size) in enumerate(zip(delivery_probabilities, delivery_sizes)):
-            if prob > probability_threshold:
-                # Use actual predicted size, not scaled by probability
-                forecast_values.append(size)
-            else:
-                forecast_values.append(0)
-        
-        forecast = np.array(forecast_values)
-        
-        print(f"Intermittent forecast generated:")
-        print(f"• Days with delivery probability > {probability_threshold}: {np.sum(forecast > 0)}")
-        print(f"• Average delivery probability: {np.mean(delivery_probabilities):.3f}")
-        print(f"• Max predicted delivery: {np.max(forecast):.1f} BBLs")
-        
-        # Create forecast dataframe
-        forecast_df = pd.DataFrame({
-            'date': forecast_dates,
-            'predicted_units': forecast,
-            'delivery_probability': delivery_probabilities
-        })
-        
-        # Light smoothing only (intermittent forecasting is naturally less spiky)
-        forecast_df['predicted_units'] = forecast_df['predicted_units'].clip(lower=0, upper=200)
-        
-        # Find the next predicted delivery date (any amount > 0, not just >= 100 BBLs)
-        next_any_delivery = forecast_df[forecast_df['predicted_units'] > 0]
-        if len(next_any_delivery) > 0:
-            next_any_delivery_date = next_any_delivery['date'].iloc[0]
-            next_any_delivery_amount = next_any_delivery['predicted_units'].iloc[0]
-        else:
-            next_any_delivery_date = None
-            next_any_delivery_amount = 0
-        
-        # Apply pattern-based prediction overlay
-        # Look at historical delivery patterns to enhance predictions
-        historical_delivery_dates = ts_data[ts_data['by_units'] >= 100.0].index
-        pattern_based_next_delivery = None
-        
-        if len(historical_delivery_dates) >= 2:
-            # Calculate average days between significant deliveries
-            intervals = [(historical_delivery_dates[i] - historical_delivery_dates[i-1]).days 
-                        for i in range(1, len(historical_delivery_dates))]
-            avg_interval = sum(intervals) / len(intervals)
-            
-            # Predict next delivery based on pattern
-            last_delivery = historical_delivery_dates[-1]
-            pattern_based_next_delivery = last_delivery + timedelta(days=int(avg_interval))
-            
-            print(f"📊 Pattern-based analysis:")
-            print(f"• Average interval between deliveries: {avg_interval:.1f} days")
-            print(f"• Last delivery: {last_delivery.date()}")
-            print(f"• Expected next delivery (pattern-based): {pattern_based_next_delivery.date()}")
-            
-            # Boost prediction around expected delivery date
-            for i, row in forecast_df.iterrows():
-                days_from_expected = abs((row['date'] - pattern_based_next_delivery).days)
-                if days_from_expected <= 3:  # Within 3 days of expected
-                    boost_factor = 1.5 - (days_from_expected * 0.1)
-                    forecast_df.loc[i, 'predicted_units'] *= boost_factor
-                    print(f"📈 Boosted prediction for {row['date'].date()}: {forecast_df.loc[i, 'predicted_units']:.1f} BBLs")
-        
-        # For intermittent deliveries, find the most confident prediction and filter accordingly
-        all_predictions = forecast_df[forecast_df['predicted_units'] > 0]
-        
-        if len(all_predictions) > 0:
-            # Find the prediction with highest confidence (highest predicted units)
-            most_confident = all_predictions.loc[all_predictions['predicted_units'].idxmax()]
-            most_confident_date = most_confident['date']
-            
-            print(f"Most confident prediction: {most_confident_date.date()} with {most_confident['predicted_units']:.1f} BBLs")
-            
-            # Only show predictions on or after the most confident date
-            # This removes earlier, less confident predictions
-            top_forecasts = all_predictions[all_predictions['date'] >= most_confident_date].copy()
-            top_forecasts = top_forecasts.sort_values('date')  # Sort by date
-            
-            print(f"Filtered to {len(top_forecasts)} predictions on/after most confident date")
-        else:
-            top_forecasts = pd.DataFrame()
-        
-        if len(top_forecasts) > 0:
-            print(f"Top {len(top_forecasts)} predicted deliveries:")
-            for i, (_, row) in enumerate(top_forecasts.iterrows(), 1):
-                print(f"  {i}. {row['date'].date()}: {row['predicted_units']:.1f} BBLs")
-            
-            # Use the highest probability delivery as best estimate
-            best_next_delivery_date = top_forecasts['date'].iloc[0]
-            print(f"🎯 Next delivery (ML): {best_next_delivery_date.date()}")
-        elif pattern_based_next_delivery is not None:
-            # Use pattern-based prediction
-            best_next_delivery_date = pattern_based_next_delivery
-            print(f"🎯 Next delivery (pattern-based): {best_next_delivery_date.date()}")
-            
-            # Don't include pattern-based predictions in the main forecast
-            # (they'll be handled separately in the summary)
-            top_forecasts = pd.DataFrame()
-        else:
-            best_next_delivery_date = None
-            top_forecasts = pd.DataFrame()
-            print("🎯 No next delivery date could be determined")
-        
-        forecast_df = top_forecasts
-        
-        # Use the earliest forecast date as the next delivery date (should match the forecast)
-        if len(forecast_df) > 0:
-            next_delivery_date = forecast_df['date'].iloc[0]
-            print(f"Next predicted delivery date: {next_delivery_date.date()}")
-            print(f"Predicted units: {forecast_df['predicted_units'].iloc[0]:.1f}")
-            
-            # Use the ML prediction as the best estimate (overriding pattern-based)
-            best_next_delivery_date = next_delivery_date
-        else:
-            print("No deliveries predicted in the next 4 weeks")
-            next_delivery_date = best_next_delivery_date  # Use pattern-based if available
-        
-        # Return both the significant forecast and the best next delivery date estimate
-        return forecast_df, next_delivery_date, best_next_delivery_date
+        return forecast_exog
     
-    def calculate_delivery_statistics(self, ts_data):
-        """Calculate statistics about delivery patterns"""
-        print("Calculating delivery statistics...")
+    def _pattern_based_forecast(self, ts_data, delivery_stats, forecast_dates):
+        """Generate pattern-based forecast using historical intervals"""
+        forecast = np.zeros(len(forecast_dates))
         
-        # Find actual delivery dates (where units > 0)
-        delivery_dates = ts_data[ts_data['by_units'] > 0].index.tolist()
+        if not delivery_stats:
+            return forecast
         
-        if len(delivery_dates) < 2:
-            print("Not enough delivery dates to calculate statistics")
-            return None
+        last_delivery = delivery_stats['last_delivery_date']
+        avg_interval = delivery_stats['avg_interval']
+        avg_size = ts_data[ts_data['by_units'] > 0]['by_units'].mean()
         
-        # Calculate days between consecutive deliveries
-        days_between = []
-        for i in range(1, len(delivery_dates)):
-            days_diff = (delivery_dates[i] - delivery_dates[i-1]).days
-            days_between.append(days_diff)
+        # Predict delivery around expected interval
+        expected_delivery_date = last_delivery + timedelta(days=int(avg_interval))
         
-        if not days_between:
-            return None
+        for i, date in enumerate(forecast_dates):
+            days_diff = abs((date - expected_delivery_date).days)
+            if days_diff <= 3:  # Within 3-day window
+                # Gaussian-like probability
+                prob = np.exp(-0.5 * (days_diff / 1.5) ** 2)
+                forecast[i] = avg_size * prob
         
-        # Calculate statistics
-        avg_days_between = sum(days_between) / len(days_between)
-        min_days_between = min(days_between)
-        max_days_between = max(days_between)
-        
-        # Calculate statistics for significant deliveries (≥100 BBLs)
-        significant_delivery_dates = ts_data[ts_data['by_units'] >= 100.0].index.tolist()
-        
-        avg_days_between_significant = None
-        if len(significant_delivery_dates) >= 2:
-            sig_days_between = []
-            for i in range(1, len(significant_delivery_dates)):
-                days_diff = (significant_delivery_dates[i] - significant_delivery_dates[i-1]).days
-                sig_days_between.append(days_diff)
-            
-            if sig_days_between:
-                avg_days_between_significant = sum(sig_days_between) / len(sig_days_between)
-        
-        stats = {
-            'avg_days_between_all': avg_days_between,
-            'min_days_between': min_days_between,
-            'max_days_between': max_days_between,
-            'avg_days_between_significant': avg_days_between_significant,
-            'total_deliveries': len(delivery_dates),
-            'significant_deliveries': len(significant_delivery_dates)
-        }
-        
-        print(f"Average days between deliveries (all): {avg_days_between:.1f}")
-        print(f"Average days between significant deliveries (≥100 BBLs): {avg_days_between_significant:.1f}" if avg_days_between_significant else "Not enough significant deliveries")
-        print(f"Range: {min_days_between} to {max_days_between} days")
-        
-        # Analyze the delivery pattern to understand spikiness
-        delivery_volumes = ts_data[ts_data['by_units'] > 0]['by_units'].values
-        zero_days = len(ts_data[ts_data['by_units'] == 0])
-        delivery_days = len(ts_data[ts_data['by_units'] > 0])
-        
-        print(f"\n📊 Delivery Pattern Analysis:")
-        print(f"• Zero delivery days: {zero_days}")
-        print(f"• Delivery days: {delivery_days}")
-        print(f"• Delivery frequency: {delivery_days/(delivery_days + zero_days)*100:.1f}% of days")
-        print(f"• Average delivery size: {delivery_volumes.mean():.1f} BBLs")
-        print(f"• This explains the spiky forecast - deliveries are rare but large!")
-        
-        return stats
+        return forecast
     
-    def create_forecast_visualization(self, ts_data, forecast_df, next_delivery_date):
-        """Create visualization showing historical data, model fit, and forecast"""
-        print("Creating forecast visualization...")
+    def create_forecast_visualization(self, ts_data, forecast_df, next_delivery_date, delivery_stats):
+        """Create visualization showing historical data and forecast"""
+        print("\nCreating forecast visualization...")
         
         try:
-            # Set up the plot
-            plt.figure(figsize=(15, 10))
+            fig, axes = plt.subplots(2, 1, figsize=(15, 10))
             
-            # Prepare data for plotting - extend to show 2 weeks from today
-            last_60_days = ts_data.tail(60).copy()  # Show last 60 days of historical data
+            # Plot 1: Historical + Forecast
+            ax1 = axes[0]
+            last_60_days = ts_data.tail(60).copy()
             
-            # Create the full forecast period (all predictions, not just ≥100 BBLs)
-            forecast_start = datetime.combine(self.today, datetime.min.time())
-            full_forecast_dates = pd.date_range(
-                start=forecast_start,
-                periods=self.forecast_horizon,
-                freq='D'
-            )
-            
-            # Generate the full forecast for visualization (including all values)
-            try:
-                last_data_date = ts_data.index[-1]
-                days_gap = (forecast_start.date() - last_data_date.date()).days
-                total_steps = self.forecast_horizon + max(0, days_gap)
-                
-                print(f"Visualization: Last data date: {last_data_date.date()}")
-                print(f"Visualization: Forecast start: {forecast_start.date()}")
-                print(f"Visualization: Days gap: {days_gap}, Total steps: {total_steps}")
-                
-                # We need to create exogenous variables for the full forecast period
-                if days_gap > 0:
-                    # Create extended exogenous variables for the full forecast period
-                    extended_dates = pd.date_range(
-                        start=last_data_date + timedelta(days=1),
-                        periods=total_steps,
-                        freq='D'
-                    )
-                    extended_exog = pd.DataFrame(index=extended_dates)
-                    
-                    # Use last known strain and strain_type as default
-                    last_strain = ts_data['strain_encoded'].iloc[-1]
-                    last_strain_type = ts_data['strain_type_encoded'].iloc[-1]
-                    extended_exog['strain_encoded'] = last_strain
-                    extended_exog['strain_type_encoded'] = last_strain_type
-                    
-                    # Time-based features
-                    extended_exog['day_of_week'] = extended_exog.index.dayofweek
-                    extended_exog['day_of_month'] = extended_exog.index.day
-                    extended_exog['month'] = extended_exog.index.month
-                    extended_exog['quarter'] = extended_exog.index.quarter
-                    
-                    # Rolling averages
-                    recent_avg_7 = ts_data['by_units'].tail(7).mean()
-                    recent_avg_14 = ts_data['by_units'].tail(14).mean()
-                    extended_exog['rolling_7'] = recent_avg_7
-                    extended_exog['rolling_14'] = recent_avg_14
-                    
-                    viz_exog = extended_exog
-                else:
-                    # Create exog for just the forecast period
-                    viz_exog = pd.DataFrame(index=full_forecast_dates)
-                    last_strain = ts_data['strain_encoded'].iloc[-1]
-                    last_strain_type = ts_data['strain_type_encoded'].iloc[-1]
-                    viz_exog['strain_encoded'] = last_strain
-                    viz_exog['strain_type_encoded'] = last_strain_type
-                    viz_exog['day_of_week'] = viz_exog.index.dayofweek
-                    viz_exog['day_of_month'] = viz_exog.index.day
-                    viz_exog['month'] = viz_exog.index.month
-                    viz_exog['quarter'] = viz_exog.index.quarter
-                    recent_avg_7 = ts_data['by_units'].tail(7).mean()
-                    recent_avg_14 = ts_data['by_units'].tail(14).mean()
-                    viz_exog['rolling_7'] = recent_avg_7
-                    viz_exog['rolling_14'] = recent_avg_14
-                
-                # Generate forecast for visualization
-                full_viz_forecast = self.forecaster.predict(steps=total_steps, exog=viz_exog)
-                
-                if days_gap > 0:
-                    viz_forecast_values = full_viz_forecast[-self.forecast_horizon:]
-                else:
-                    viz_forecast_values = full_viz_forecast
-                    
-                # Create full forecast dataframe for visualization
-                full_forecast_df = pd.DataFrame({
-                    'date': full_forecast_dates,
-                    'predicted_units': viz_forecast_values
-                })
-                
-                print(f"Generated visualization forecast with {len(full_forecast_df)} points")
-                
-            except Exception as e:
-                print(f"Error generating visualization forecast: {str(e)}")
-                # Fallback: create dummy forecast data for visualization
-                full_forecast_df = pd.DataFrame({
-                    'date': full_forecast_dates,
-                    'predicted_units': [0] * len(full_forecast_dates)
-                })
-            
-            # Create subplots
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
-            
-            # Plot 1: Historical data with continuous forecast line
+            # Historical data
             ax1.plot(last_60_days.index, last_60_days['by_units'], 
-                    'b-', linewidth=2, label='Historical Deliveries', alpha=0.7)
+                    'b-o', linewidth=2, markersize=4, label='Historical', alpha=0.7)
             
-            # Create a complete continuous line from historical data through forecast
-            if len(full_forecast_df) > 0:
-                # Get the last few historical points to create smooth transition
-                transition_historical = last_60_days.tail(5)  # Last 5 days for smooth connection
-                
-                # Combine historical transition data with forecast data
-                combined_dates = list(transition_historical.index) + list(full_forecast_df['date'])
-                combined_values = list(transition_historical['by_units']) + list(full_forecast_df['predicted_units'])
-                
-                # Plot the complete continuous line
-                ax1.plot(combined_dates, combined_values, 
-                        'b-', linewidth=2, label='Complete Model (Historical + Forecast)', alpha=0.8)
-                
-                # Add a vertical line to separate historical from forecast
-                forecast_start_line = full_forecast_df['date'].iloc[0]
-                ax1.axvline(x=forecast_start_line, color='orange', linestyle='--', alpha=0.6, linewidth=1, label='Forecast Start')
-            
-            # Add significant forecast points (≥100 BBLs) as markers
-            # Size markers by delivery probability for intermittent forecasting
+            # Forecast
             if len(forecast_df) > 0:
-                # Get full forecast data for visualization (including probabilities)
-                full_forecast_viz = pd.DataFrame({
-                    'date': full_forecast_df['date'],
-                    'predicted_units': full_forecast_df['predicted_units']
-                })
+                ax1.scatter(forecast_df['date'], forecast_df['predicted_units'],
+                           s=forecast_df['confidence']*200, c='red', alpha=0.6,
+                           label='Forecast (size=confidence)', zorder=5)
                 
-                # Add probability info if available
-                if 'delivery_probability' in full_forecast_df.columns:
-                    full_forecast_viz['probability'] = full_forecast_df['delivery_probability']
-                    # Size scatter points by probability
-                    sizes = full_forecast_viz['probability'] * 100  # Scale for visibility
-                    ax1.scatter(forecast_df['date'], forecast_df['predicted_units'], 
-                               c=forecast_df['delivery_probability'], s=sizes, 
-                               cmap='Reds', label='Deliveries (size=probability)', 
-                               marker='o', zorder=5, edgecolor='darkred', alpha=0.7)
-                else:
-                    ax1.scatter(forecast_df['date'], forecast_df['predicted_units'], 
-                               color='red', s=50, label='Significant Deliveries (≥100 BBLs)', 
-                               marker='o', zorder=5, edgecolor='darkred')
+                # Confidence intervals
+                for _, row in forecast_df.iterrows():
+                    ax1.vlines(row['date'], row['lower_bound'], row['upper_bound'],
+                             colors='red', alpha=0.3, linewidth=2)
                 
-                # Highlight next delivery with larger marker
-                if next_delivery_date is not None:
-                    next_delivery_units = forecast_df[forecast_df['date'] == next_delivery_date]['predicted_units'].iloc[0]
-                    ax1.scatter(next_delivery_date, next_delivery_units, 
-                               color='red', s=150, label=f'Next Delivery: {next_delivery_date.date()}',
-                               marker='*', zorder=6, edgecolor='darkred')
+                # Highlight next delivery
+                if next_delivery_date:
+                    next_row = forecast_df[forecast_df['date'] == next_delivery_date].iloc[0]
+                    ax1.scatter(next_delivery_date, next_row['predicted_units'],
+                               s=300, marker='*', c='darkred', edgecolors='black',
+                               label=f"Next: {next_delivery_date.date()}", zorder=6)
             
-            # Add vertical line to show today
-            ax1.axvline(x=forecast_start, color='green', linestyle=':', alpha=0.7, linewidth=2, label='Today')
+            # Today marker
+            ax1.axvline(x=datetime.combine(self.today, datetime.min.time()),
+                       color='green', linestyle='--', alpha=0.7, linewidth=2, label='Today')
             
-            ax1.set_title('Fieldwork Delivery Forecast', fontsize=16, fontweight='bold')
-            ax1.set_xlabel('Date', fontsize=12)
-            ax1.set_ylabel('Delivery Volume (BBLs)', fontsize=12)
-            ax1.legend(fontsize=10)
+            ax1.set_title('Fieldwork Delivery Forecast (Ensemble Method)', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('Date')
+            ax1.set_ylabel('Delivery Volume (BBLs)')
+            ax1.legend(loc='best')
             ax1.grid(True, alpha=0.3)
-            
-            # Set x-axis limits to ensure full 3-week forecast period is visible
-            forecast_end = forecast_start + timedelta(days=self.forecast_horizon)
-            ax1.set_xlim(last_60_days.index[0], forecast_end)
-            
-            # Format x-axis dates
             ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
-            ax1.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))  # Every 2 days to avoid crowding
             plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
             
-            # Plot 2: Distribution of historical deliveries
-            ax2.hist(ts_data[ts_data['by_units'] > 0]['by_units'], bins=30, alpha=0.7, color='skyblue', edgecolor='black')
-            ax2.axvline(100, color='red', linestyle='--', linewidth=2, label='100 BBL Threshold')
-            ax2.set_title('Distribution of Historical Delivery Volumes', fontsize=14, fontweight='bold')
-            ax2.set_xlabel('Delivery Volume (BBLs)', fontsize=12)
-            ax2.set_ylabel('Frequency', fontsize=12)
+            # Plot 2: Delivery distribution
+            ax2 = axes[1]
+            delivery_data = ts_data[ts_data['by_units'] > 0]['by_units']
+            ax2.hist(delivery_data, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+            ax2.axvline(delivery_data.mean(), color='red', linestyle='--', linewidth=2,
+                       label=f'Mean: {delivery_data.mean():.1f} BBLs')
+            ax2.set_title('Historical Delivery Size Distribution', fontsize=12, fontweight='bold')
+            ax2.set_xlabel('Delivery Volume (BBLs)')
+            ax2.set_ylabel('Frequency')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             
-            # Add summary statistics
-            stats_text = f"""
-Model Summary:
-• Training Period: {ts_data.index.min().date()} to {ts_data.index.max().date()}
-• Total Observations: {len(ts_data)}
-• Average Delivery: {ts_data[ts_data['by_units'] > 0]['by_units'].mean():.1f} BBLs
-• Forecast Generated: {self.today}
-• Next Delivery ≥100 BBLs: {next_delivery_date.date() if next_delivery_date else 'None in next 4 weeks'}
-            """
+            # Add summary text
+            stats_text = f"""Forecast Summary:
+Training Period: {ts_data.index.min().date()} to {ts_data.index.max().date()}
+Total Observations: {len(ts_data)} | Delivery Days: {(ts_data['by_units'] > 0).sum()}
+Avg Interval: {delivery_stats['avg_interval']:.1f} days | Generated: {self.today}
+Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
             
-            plt.figtext(0.02, 0.02, stats_text, fontsize=10, 
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8))
+            if self.validation_metrics:
+                stats_text += f"\nValidation MAE: {self.validation_metrics['MAE']:.1f} BBLs"
+            
+            plt.figtext(0.02, 0.02, stats_text, fontsize=9,
+                       bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8))
             
             plt.tight_layout()
-            plt.subplots_adjust(bottom=0.15)  # Make room for summary text
+            plt.subplots_adjust(bottom=0.15)
             
-            # Save the plot
             plot_filename = f"fieldwork_forecast_{self.today.strftime('%Y%m%d')}.png"
             plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
-            print(f"Forecast visualization saved as: {plot_filename}")
-            
-            plt.close()  # Close to free memory
+            print(f"✓ Visualization saved: {plot_filename}")
+            plt.close()
             
             return plot_filename
             
         except Exception as e:
             print(f"Error creating visualization: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return None
     
-    def write_forecast_to_sheets(self, forecast_df, next_delivery_date, all_next_delivery_dates=None, best_next_delivery_date=None):
-        """Write forecast results to Google Sheets starting at column F (index 6)"""
-        print("Writing forecast to Google Sheets...")
-        
-        # Use best next delivery date if available, otherwise use the significant delivery date
-        display_next_delivery = best_next_delivery_date if best_next_delivery_date is not None else next_delivery_date
+    def write_forecast_to_sheets(self, forecast_df, next_delivery_date, delivery_stats, group_name='Overall'):
+        """Write forecast results to Google Sheets"""
+        print("\nWriting forecast to Google Sheets...")
         
         try:
             sheet = self.gc.open(self.sheet_name)
             worksheet = sheet.worksheet(self.tab_name)
             
-            # Clear existing forecast data completely (columns F onwards)
-            # Get the current sheet dimensions
+            # Clear previous forecast data
             all_values = worksheet.get_all_values()
             if all_values:
                 last_row = len(all_values)
-                # Clear a wide range to ensure all previous forecast data is removed
-                # Columns F through Z should be more than enough
-                clear_range = f"F1:Z{last_row + 10}"  # Add extra rows for safety
-                print(f"Clearing previous forecast data in range: {clear_range}")
-                worksheet.batch_clear([clear_range])
-                
-                # Also clear any data that might be in columns beyond Z
-                extended_clear_range = f"AA1:AZ{last_row + 10}"
-                try:
-                    worksheet.batch_clear([extended_clear_range])
-                    print("Also cleared extended range AA:AZ")
-                except:
-                    pass  # Ignore errors if these columns don't exist
-                
-                # Small delay to ensure clearing is complete
+                worksheet.batch_clear([f"F1:Z{last_row + 10}"])
                 import time
                 time.sleep(1)
-                
-                # Verify clearing worked by checking if F1 is empty
-                try:
-                    test_cell = worksheet.acell('F1').value
-                    if test_cell:
-                        print(f"Warning: F1 still contains data: {test_cell}")
-                    else:
-                        print("Verification: Previous forecast data cleared successfully")
-                except:
-                    print("Previous forecast data cleared successfully")
             
-            # Prepare forecast data for writing
-            if next_delivery_date is not None:
-                # Write headers with group name column
-                headers = ['Forecast Date', 'Predicted Units', 'Group Name', 'Generated On', 'Next Delivery Date']
-                worksheet.update('F1:J1', [headers])
-                
-                # Prepare forecast data
-                # Calculate the most likely delivery date for each group
-                # Use the prediction with highest confidence (highest predicted units)
-                group_best = {}
-                for group_name in forecast_df['group_name'].unique():
-                    group_data = forecast_df[forecast_df['group_name'] == group_name]
-                    # Get the date with the highest predicted units (most confident prediction)
-                    best_prediction = group_data.loc[group_data['predicted_units'].idxmax()]
-                    group_best[group_name] = best_prediction['date']
-                
-                forecast_data = []
+            # Write headers
+            headers = ['Forecast Date', 'Predicted Units', 'Lower Bound', 'Upper Bound',
+                      'Confidence', 'Group', 'Generated On', 'Next Delivery', 'Days Until']
+            worksheet.update('F1:N1', [headers])
+            
+            # Prepare forecast data
+            forecast_data = []
+            if len(forecast_df) > 0:
                 for _, row in forecast_df.iterrows():
-                    group_name = row.get('group_name', 'Unknown')
-                    best_for_group = group_best.get(group_name, row['date'])
-                    
+                    days_until = (row['date'].date() - self.today).days
                     forecast_data.append([
                         row['date'].strftime('%Y-%m-%d'),
                         f"{row['predicted_units']:.1f}",
+                        f"{row['lower_bound']:.1f}",
+                        f"{row['upper_bound']:.1f}",
+                        f"{row['confidence']:.2f}",
                         group_name,
                         self.today.strftime('%Y-%m-%d'),
-                        best_for_group.strftime('%Y-%m-%d')  # Show most confident delivery for this group
+                        next_delivery_date.strftime('%Y-%m-%d') if next_delivery_date else 'TBD',
+                        str(days_until) if next_delivery_date else 'TBD'
                     ])
                 
-                # Write forecast data
-                if forecast_data:
-                    end_row = len(forecast_data) + 1
-                    range_name = f"F2:J{end_row}"
-                    worksheet.update(range_name, forecast_data)
-                
-                # Write summary information by group
-                # Collect next delivery dates by group from the combined forecast
-                group_summaries = {}
-                if len(forecast_df) > 0:
-                    # Group by group_name and get the most confident delivery for each
-                    for group_name in forecast_df['group_name'].unique():
-                        group_data = forecast_df[forecast_df['group_name'] == group_name]
-                        # Get the prediction with highest confidence (highest predicted units)
-                        best_prediction = group_data.loc[group_data['predicted_units'].idxmax()]
-                        best_date = best_prediction['date']
-                        days_until = (best_date.date() - self.today).days
-                        group_summaries[group_name] = {
-                            'date': best_date,
-                            'days_until': days_until
-                        }
-                
-                # Also include pattern-based predictions from all_next_delivery_dates
-                # that might not be in the main forecast
-                if all_next_delivery_dates:
-                    for delivery_info in all_next_delivery_dates:
-                        group_name = delivery_info['group_name']
-                        if group_name not in group_summaries:
-                            delivery_date = delivery_info['date']
-                            days_until = (delivery_date.date() - self.today).days
-                            group_summaries[group_name] = {
-                                'date': delivery_date,
-                                'days_until': days_until
-                            }
-                
-                # Write group-specific summaries
-                summary_headers = ['Group', 'Next Delivery', 'Days Until']
-                worksheet.update('K1:M1', [summary_headers])
-                
-                summary_data = []
-                for i, (group_name, info) in enumerate(group_summaries.items()):
-                    summary_data.append([
-                        group_name,
-                        info['date'].strftime('%Y-%m-%d'),
-                        str(info['days_until'])
-                    ])
-                
-                if summary_data:
-                    end_summary_row = len(summary_data) + 1
-                    worksheet.update(f'K2:M{end_summary_row}', summary_data)
-                    print(f"✅ Group summaries written to K2:M{end_summary_row}")
-                else:
-                    # Fallback: write overall next delivery if no group data
-                    days_until = (next_delivery_date.date() - self.today).days
-                    fallback_data = [['Overall', next_delivery_date.strftime('%Y-%m-%d'), str(days_until)]]
-                    worksheet.update('K2:M2', fallback_data)
-                
-                # Delivery statistics section removed to avoid variable scope issues
-                
-                print(f"Forecast written successfully. Next delivery: {next_delivery_date.date()}")
-                
+                end_row = len(forecast_data) + 1
+                worksheet.update(f'F2:N{end_row}', forecast_data)
             else:
-                # No significant deliveries predicted, but still show next delivery date if available
-                if display_next_delivery:
-                    headers = ['Forecast Status', 'Generated On', 'Next Delivery Date (Any Amount)']
-                    worksheet.update('F1:H1', [headers])
-                    
-                    status_data = ['No deliveries ≥100 BBL predicted in next 4 weeks', 
-                                  self.today.strftime('%Y-%m-%d'),
-                                  display_next_delivery.strftime('%Y-%m-%d')]
-                    worksheet.update('F2:H2', [status_data])
-                else:
-                    headers = ['Forecast Status', 'Generated On']
-                    worksheet.update('F1:G1', [headers])
-                    
-                    status_data = ['No deliveries predicted in next 4 weeks', self.today.strftime('%Y-%m-%d')]
-                    worksheet.update('F2:G2', [status_data])
+                # No forecasts
+                status_data = [['No deliveries predicted', '', '', '', '', group_name,
+                              self.today.strftime('%Y-%m-%d'),
+                              next_delivery_date.strftime('%Y-%m-%d') if next_delivery_date else 'TBD',
+                              str((next_delivery_date.date() - self.today).days) if next_delivery_date else 'TBD']]
+                worksheet.update('F2:N2', [status_data])
+            
+            # Write validation metrics if available
+            if self.validation_metrics:
+                metrics_row = len(forecast_data) + 3
+                metrics_headers = ['Metric', 'Value']
+                worksheet.update(f'F{metrics_row}:G{metrics_row}', [metrics_headers])
                 
-                # Delivery statistics section removed to avoid variable scope issues
+                metrics_data = [
+                    ['MAE (BBLs)', f"{self.validation_metrics['MAE']:.2f}"],
+                    ['RMSE (BBLs)', f"{self.validation_metrics['RMSE']:.2f}"],
+                    ['Accuracy (%)', f"{self.validation_metrics['accuracy']*100:.1f}"]
+                ]
+                worksheet.update(f'F{metrics_row+1}:G{metrics_row+3}', metrics_data)
+            
+            # Write delivery statistics
+            if delivery_stats:
+                stats_row = len(forecast_data) + 7
+                stats_headers = ['Statistic', 'Value']
+                worksheet.update(f'F{stats_row}:G{stats_row}', [stats_headers])
                 
-                print("No deliveries predicted - status written to sheet")
-                
+                stats_data = [
+                    ['Avg Interval (days)', f"{delivery_stats['avg_interval']:.1f}"],
+                    ['Std Interval (days)', f"{delivery_stats['std_interval']:.1f}"],
+                    ['Min Interval (days)', str(delivery_stats['min_interval'])],
+                    ['Max Interval (days)', str(delivery_stats['max_interval'])],
+                    ['Total Deliveries', str(delivery_stats['total_deliveries'])],
+                    ['Last Delivery', delivery_stats['last_delivery_date'].strftime('%Y-%m-%d')]
+                ]
+                worksheet.update(f'F{stats_row+1}:G{stats_row+6}', stats_data)
+            
+            print("✓ Forecast written to Google Sheets successfully")
+            
         except Exception as e:
             print(f"Error writing to Google Sheets: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise
     
     def run_forecast(self):
-        """Main method to run the complete forecasting pipeline"""
-        print("Starting Fieldwork forecasting pipeline...")
-        print(f"Today's date: {self.today}")
+        """Main forecasting pipeline"""
+        print("="*60)
+        print("FIELDWORK DELIVERY FORECASTING - ENSEMBLE METHOD")
+        print("="*60)
+        print(f"Date: {self.today}\n")
         
         try:
-            # Load data from Google Sheets
+            # Load and preprocess data
             raw_data = self.load_data_from_sheets()
-            
-            # Preprocess data
             clean_data = self.preprocess_data(raw_data)
             
-            # Check both individual strains and strain types for sufficient data
-            strain_candidates = []
+            # Group by strain_type for better data aggregation
+            viable_groups = []
+            for strain_type in clean_data['strain_type'].unique():
+                group_data = clean_data[clean_data['strain_type'] == strain_type]
+                if len(group_data) >= 10:  # Minimum threshold
+                    viable_groups.append(('strain_type', strain_type, group_data))
             
-            # First try individual strains with enough data
-            for strain in clean_data['strain'].unique():
-                strain_data = clean_data[clean_data['strain'] == strain]
-                if len(strain_data) >= 15:  # Higher threshold for individual strains
-                    strain_candidates.append(('strain', strain, strain_data))
+            if not viable_groups:
+                print("⚠️ No groups with sufficient data, using all data combined")
+                viable_groups = [('all', 'All Data', clean_data)]
             
-            # If no individual strains have enough data, try strain types
-            if not strain_candidates:
-                for strain_type in clean_data['strain_type'].unique():
-                    strain_type_data = clean_data[clean_data['strain_type'] == strain_type]
-                    if len(strain_type_data) >= 10:  # Medium threshold for strain types
-                        strain_candidates.append(('strain_type', strain_type, strain_type_data))
-            
-            print(f"Found {len(strain_candidates)} viable forecasting candidates")
+            print(f"\n📦 Found {len(viable_groups)} viable forecasting group(s)")
             
             all_forecasts = []
-            all_next_delivery_dates = []
+            all_next_dates = []
             
-            # Create separate forecast for each viable strain/strain_type
-            for group_type, group_name, strain_data in strain_candidates:
-                print(f"\n=== Forecasting for {group_type}: {group_name} ===")
-                print(f"Data points: {len(strain_data)} records")
+            # Forecast each group
+            for group_type, group_name, group_data in viable_groups:
+                print(f"\n{'='*60}")
+                print(f"Forecasting: {group_name} ({len(group_data)} records)")
+                print(f"{'='*60}")
                 
-                # Create time series for this strain
-                ts_data = self.create_time_series(strain_data)
+                # Create time series
+                ts_data = self.create_time_series(group_data)
                 
-                # Train intermittent forecaster for this strain
-                self.train_intermittent_forecaster(ts_data)
-                
-                # Calculate delivery statistics for this strain
+                # Calculate statistics
                 delivery_stats = self.calculate_delivery_statistics(ts_data)
                 
-                # Make forecast for this strain
-                forecast_df, next_delivery_date, best_next_delivery_date = self.make_forecast(ts_data)
+                # Train models
+                self.train_ensemble_forecaster(ts_data)
                 
-                # Add group info to forecast
+                # Generate forecast
+                forecast_df, next_delivery_date = self.make_forecast(ts_data, delivery_stats)
+                
                 if len(forecast_df) > 0:
-                    forecast_df['group_type'] = group_type
                     forecast_df['group_name'] = group_name
                     all_forecasts.append(forecast_df)
-                    
+                
                 if next_delivery_date:
-                    all_next_delivery_dates.append({
-                        'group_type': group_type,
+                    all_next_dates.append({
                         'group_name': group_name,
-                        'date': next_delivery_date,
-                        'best_date': best_next_delivery_date
+                        'date': next_delivery_date
                     })
                 
-                # Also add pattern-based predictions even if no ML predictions
-                if best_next_delivery_date and not next_delivery_date:
-                    all_next_delivery_dates.append({
-                        'group_type': group_type,
-                        'group_name': group_name,
-                        'date': best_next_delivery_date,
-                        'best_date': best_next_delivery_date
-                    })
+                # Create visualization (for first group only to save time)
+                if group_type == viable_groups[0][0]:
+                    self.create_forecast_visualization(ts_data, forecast_df, next_delivery_date, delivery_stats)
             
-            # Combine all strain forecasts
+            # Combine all forecasts
             if all_forecasts:
                 combined_forecast = pd.concat(all_forecasts, ignore_index=True)
                 combined_forecast = combined_forecast.sort_values('date')
+                
+                # Find earliest delivery
+                earliest_delivery = min(all_next_dates, key=lambda x: x['date']) if all_next_dates else None
+                next_delivery_date = earliest_delivery['date'] if earliest_delivery else None
+                
+                # Write to sheets
+                self.write_forecast_to_sheets(combined_forecast, next_delivery_date, delivery_stats,
+                                             earliest_delivery['group_name'] if earliest_delivery else 'Overall')
             else:
-                combined_forecast = pd.DataFrame()
+                # Write empty forecast with next date if available
+                next_delivery_date = all_next_dates[0]['date'] if all_next_dates else None
+                self.write_forecast_to_sheets(pd.DataFrame(), next_delivery_date, delivery_stats)
             
-            # Add pattern-based predictions that don't have ML forecasts to the main table
-            for delivery_info in all_next_delivery_dates:
-                group_name = delivery_info['group_name']
-                # Check if this group already has ML predictions
-                if len(combined_forecast) == 0 or group_name not in combined_forecast['group_name'].values:
-                    # Use historical average for pattern-based predictions
-                    # Filter data for this specific group to get realistic units
-                    if delivery_info['group_type'] == 'strain_type':
-                        group_data = clean_data[clean_data['strain_type'] == group_name]
-                    else:
-                        group_data = clean_data[clean_data['strain'] == group_name]
-                    
-                    # Calculate average delivery size for this group
-                    avg_units = group_data[group_data['by_units'] > 0]['by_units'].mean()
-                    if pd.isna(avg_units):
-                        avg_units = 100.0  # Default fallback
-                    
-                    # Add pattern-based prediction to the main forecast
-                    pattern_row = pd.DataFrame({
-                        'date': [delivery_info['date']],
-                        'predicted_units': [avg_units],  # Use historical average
-                        'group_type': [delivery_info.get('group_type', 'pattern')],
-                        'group_name': [group_name]
-                    })
-                    combined_forecast = pd.concat([combined_forecast, pattern_row], ignore_index=True)
-            
-            # Sort the final combined forecast
-            if len(combined_forecast) > 0:
-                combined_forecast = combined_forecast.sort_values('date')
-                
-                # Find the earliest next delivery across all groups
-                if all_next_delivery_dates:
-                    earliest_delivery = min(all_next_delivery_dates, key=lambda x: x['date'])
-                    next_delivery_date = earliest_delivery['date']
-                    best_next_delivery_date = earliest_delivery['best_date']
-                    print(f"\nEarliest next delivery: {next_delivery_date} ({earliest_delivery['group_name']})")
-                else:
-                    next_delivery_date = None
-                    best_next_delivery_date = None
-                
-                # Write combined results to Google Sheets
-                self.write_forecast_to_sheets(combined_forecast, next_delivery_date, all_next_delivery_dates, best_next_delivery_date)
-                
-                print("Multi-strain forecasting pipeline completed successfully!")
-            else:
-                # Even if no ML forecasts, write pattern-based predictions if available
-                if all_next_delivery_dates:
-                    earliest_delivery = min(all_next_delivery_dates, key=lambda x: x['date'])
-                    next_delivery_date = earliest_delivery['date']
-                    best_next_delivery_date = earliest_delivery['best_date']
-                    print(f"\nPattern-based next delivery: {next_delivery_date} ({earliest_delivery['group_name']})")
-                    
-                    # For pattern-based predictions, just write the summary without detailed forecast
-                    # (avoid showing 0-unit "deliveries" in the spreadsheet)
-                    empty_forecast = pd.DataFrame()
-                    
-                    self.write_forecast_to_sheets(empty_forecast, next_delivery_date, all_next_delivery_dates, best_next_delivery_date)
-                    print("Pattern-based forecasting completed successfully!")
-                else:
-                    print("No forecasts generated - insufficient data for all groups")
+            print("\n" + "="*60)
+            print("✓ FORECASTING PIPELINE COMPLETED SUCCESSFULLY")
+            print("="*60)
             
         except Exception as e:
-            print(f"Error in forecasting pipeline: {str(e)}")
+            print(f"\n❌ Error in forecasting pipeline: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise
 
+
 def main():
-    """Main function for script execution"""
-    print("Fieldwork Delivery Forecasting")
-    print("=" * 50)
-    
-    # Initialize forecaster (will use environment variable for credentials)
+    """Main entry point"""
     forecaster = FieldworkForecaster()
-    
-    # Run the forecasting pipeline
     forecaster.run_forecast()
+
 
 if __name__ == "__main__":
     main()
-
