@@ -767,7 +767,7 @@ Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
                               self.today.strftime('%Y-%m-%d'),
                               next_delivery_date.strftime('%Y-%m-%d') if next_delivery_date else 'TBD',
                               str((next_delivery_date.date() - self.today).days) if next_delivery_date else 'TBD']]
-                worksheet.update('F2:N2', [status_data])
+                worksheet.update('F2:N2', status_data)
             
             # Write validation metrics if available
             if self.validation_metrics:
