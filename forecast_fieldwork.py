@@ -530,11 +530,11 @@ class FieldworkForecaster:
             ensemble_forecast[i] = np.average(forecasts, weights=weights)
         
         # Find predicted delivery dates (threshold-based)
-        delivery_threshold = 10  # BBLs
+        delivery_threshold = 100  # BBLs - only show significant deliveries
         predicted_deliveries = []
         
         for i, (date, value, confidence) in enumerate(zip(forecast_dates, ensemble_forecast, confidence_scores)):
-            if value > delivery_threshold:
+            if value >= delivery_threshold:
                 predicted_deliveries.append({
                     'date': date,
                     'predicted_units': value,
@@ -735,10 +735,17 @@ Next Delivery: {next_delivery_date.date() if next_delivery_date else 'TBD'}"""
                       'Confidence', 'Group', 'Generated On', 'Next Delivery', 'Days Until']
             worksheet.update('F1:N1', [headers])
             
+            # Filter forecast to only include deliveries >= 100 BBLs
+            if len(forecast_df) > 0:
+                significant_forecasts = forecast_df[forecast_df['predicted_units'] >= 100.0].copy()
+                print(f"Filtering forecasts: {len(forecast_df)} total → {len(significant_forecasts)} significant (≥100 BBLs)")
+            else:
+                significant_forecasts = forecast_df
+            
             # Prepare forecast data
             forecast_data = []
-            if len(forecast_df) > 0:
-                for _, row in forecast_df.iterrows():
+            if len(significant_forecasts) > 0:
+                for _, row in significant_forecasts.iterrows():
                     days_until = (row['date'].date() - self.today).days
                     forecast_data.append([
                         row['date'].strftime('%Y-%m-%d'),
