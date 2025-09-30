@@ -7,11 +7,16 @@ Integrates with Google Sheets API for data input/output
 
 import os
 import json
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set matplotlib backend BEFORE any other imports that might use it
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for WSL/headless environments
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings('ignore')
 
 # Google Sheets API
 import gspread
@@ -24,9 +29,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
 
-# Visualization
-import matplotlib
-matplotlib.use('Agg')
+# Visualization (matplotlib backend already set above)
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
